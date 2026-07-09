@@ -845,6 +845,53 @@ def estimate_dram_watts() -> float:
     return dimms * 3.0 + dimms * 2.0 * (mem.percent / 100.0)
 
 
+def read_temps() -> dict[str, float | None]:
+    temps: dict[str, float | None] = {}
+    try:
+        st = psutil.sensors_temperatures()
+        if "k10temp" in st:
+            for e in st["k10temp"]:
+                if e.label in ("Tctl", "Tdie"):
+                    temps["cpu"] = e.current
+                    break
+            if "cpu" not in temps:
+                temps["cpu"] = st["k10temp"][0].current
+        elif "coretemp" in st:
+            temps["cpu"] = st["coretemp"][0].current
+    except Exception:
+        pass
+    try:
+        from pynvml import (
+            NVML_TEMPERATURE_GPU,
+            nvmlDeviceGetCount,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetTemperature,
+            nvmlInit,
+        )
+
+        nvmlInit()
+        for i in range(nvmlDeviceGetCount()):
+            try:
+                handle = nvmlDeviceGetHandleByIndex(i)
+                temps[f"gpu{i}"] = float(
+                    nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
+                )
+            except Exception:
+                temps[f"gpu{i}"] = None
+    except Exception:
+        pass
+    try:
+        st = psutil.sensors_temperatures()
+        if "nvme" in st:
+            for e in st["nvme"]:
+                if e.label == "Composite":
+                    temps["nvme"] = e.current
+                    break
+    except Exception:
+        pass
+    return temps
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  DATA STORE
 # ══════════════════════════════════════════════════════════════════════════
@@ -1003,6 +1050,7 @@ class Collector:
             "ts": now,
             "power": dict(power),
             "total": total,
+            "temps": read_temps(),
             "cum_kwh": {k: v / 3_600_000.0 for k, v in store.cum_joules.items()},
         }
         store.append(sample)
@@ -1110,7 +1158,7 @@ Screen { background: $surface; }
 #outer { height: 100%; }
 
 #metrics-box {
-    height: auto; max-height: 8;
+    height: auto; max-height: 11;
     border: round $primary;
 }
 
@@ -1154,6 +1202,7 @@ class PowerTUI(App):
         ("3", "page(3)"),
         ("left", "page(1)"),
         ("right", "page(2)"),
+        ("i", "toggle_indicator"),
     ]
 
     def __init__(
@@ -1165,6 +1214,7 @@ class PowerTUI(App):
         self.ups_data: dict[str, str] = {}
         self.rate_source = rate_source
         self._page = 1
+        self._indicator_proc: subprocess.Popen | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1186,6 +1236,11 @@ class PowerTUI(App):
             if n:
                 self.log.info(f"Loaded {n} historical samples from daemon")
 
+    def on_unmount(self) -> None:
+        if self._indicator_proc is not None and self._indicator_proc.poll() is None:
+            self._indicator_proc.terminate()
+            self._indicator_proc = None
+
     def _poll_ups(self) -> None:
         self.ups_data = read_apc_ups()
 
@@ -1195,12 +1250,28 @@ class PowerTUI(App):
     def _paginate(self) -> bool:
         return self.size.height < PAGINATE_HEIGHT
 
+    def action_toggle_indicator(self) -> None:
+        if self._indicator_proc is not None and self._indicator_proc.poll() is None:
+            self._indicator_proc.terminate()
+            self._indicator_proc = None
+            self.notify("Indicator stopped", timeout=2)
+        else:
+            script = Path(sys.argv[0]).resolve()
+            self._indicator_proc = subprocess.Popen(
+                [str(VENV_PYTHON), str(script), "--indicator", "--no-fetch-rate"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.notify("Indicator started", timeout=2)
+
     def _metrics_content(self) -> str:
         last = self.store.last
         if not last:
             return "\n  waiting for first sample\u2026\n"
         p = last.get("power", {})
         total = last.get("total", 0)
+        t = last.get("temps", {}) or {}
 
         rapl_cpu = next(
             (v for k, v in p.items() if k.startswith("rapl_") and "package" in k), None
@@ -1227,6 +1298,10 @@ class PowerTUI(App):
         elapsed_str = str(timedelta(seconds=int(elapsed_s)))
         costs = calc_costs(self.store)
 
+        cpu_temp = t.get("cpu")
+        gpu_temps = {k: v for k, v in t.items() if k.startswith("gpu")}
+        nvme_temp = t.get("nvme")
+
         parts: list[str] = []
         parts.append(
             f" CPU {cpu_w:>5.1f} W ({cpu_src})  DRAM {dram_w:>4.1f} W ({dram_src})"
@@ -1241,6 +1316,17 @@ class PowerTUI(App):
             f"${costs['session_cost']:.2f}  "
             f"{elapsed_str}"
         )
+        temp_parts = []
+        if cpu_temp is not None:
+            temp_parts.append(f"CPU {cpu_temp:.0f}\u00b0C")
+        for idx_str in sorted(gpu_temps):
+            v = gpu_temps[idx_str]
+            if v is not None:
+                temp_parts.append(f"GPU{idx_str[3:]} {v:.0f}\u00b0C")
+        if nvme_temp is not None:
+            temp_parts.append(f"NVMe {nvme_temp:.0f}\u00b0C")
+        if temp_parts:
+            parts.append("  " + "  ".join(temp_parts))
         parts.append(f" rate ${MUNICIPAL_RATE:.2f}/kWh")
         return "\n".join("  " + p for p in parts)
 
@@ -1304,11 +1390,12 @@ class PowerTUI(App):
 
     def _rate_content(self) -> str:
         src = self.rate_source[:45] if self.rate_source else "default"
-        return (
-            f"  Rate source: {src:<45}\n"
-            f"  ${MUNICIPAL_RATE:.4f}/kWh  "
-            "POWER_RATE=<rate> ./power.py  |  ./power.py --fetch-rate\n"
+        ind = (
+            "\u25c9 Indicator on  [i] toggle"
+            if self._indicator_proc is not None and self._indicator_proc.poll() is None
+            else "\u25cb Indicator off  [i] toggle"
         )
+        return f"  Rate source: {src:<45}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
 
     def update_ui(self) -> None:
         try:
@@ -1424,10 +1511,18 @@ def run_indicator() -> None:
             costs = calc_costs(store)
             icon.icon = _create_icon(costs["monthly_cost"])
             p = store.last.get("power", {}) if store.last else {}
+            t = store.last.get("temps", {}) if store.last else {}
             total = store.last.get("total", 0) if store.last else 0
             ups = ups_watts(read_apc_ups()) or 0
+            cpu_temp = t.get("cpu")
+            gpu0_temp = t.get("gpu0")
+            temp_str = ""
+            if cpu_temp is not None:
+                temp_str += f" CPU {cpu_temp:.0f}\u00b0C"
+            if gpu0_temp is not None:
+                temp_str += f" GPU {gpu0_temp:.0f}\u00b0C"
             icon.title = (
-                f"\u26a1 {total:.0f} W  |  UPS {ups:.0f} W\n"
+                f"\u26a1 {total:.0f} W  |  UPS {ups:.0f} W{temp_str}\n"
                 f"Session: ${costs['session_cost']:.2f}  |  "
                 f"Monthly: ${costs['monthly_cost']:.1f}"
             )
@@ -1461,7 +1556,7 @@ def run_indicator() -> None:
 
     indicator = AppIndicator3.Indicator.new(
         "power-monitor",
-        "",
+        "utilities-system-monitor",
         AppIndicator3.IndicatorCategory.HARDWARE,
     )
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -1474,11 +1569,11 @@ def run_indicator() -> None:
 
     menu.append(Gtk.SeparatorMenuItem())
 
-    mi_cpu = Gtk.MenuItem(label="CPU: --- W")
+    mi_cpu = Gtk.MenuItem(label="CPU: --- W  ---\u00b0C")
     mi_cpu.set_sensitive(False)
     menu.append(mi_cpu)
 
-    mi_gpu = Gtk.MenuItem(label="GPU: --- W")
+    mi_gpu = Gtk.MenuItem(label="GPU: --- W  ---\u00b0C")
     mi_gpu.set_sensitive(False)
     menu.append(mi_gpu)
 
@@ -1489,6 +1584,10 @@ def run_indicator() -> None:
     mi_ups = Gtk.MenuItem(label="UPS: --- W")
     mi_ups.set_sensitive(False)
     menu.append(mi_ups)
+
+    mi_nvme = Gtk.MenuItem(label="NVMe: ---\u00b0C")
+    mi_nvme.set_sensitive(False)
+    menu.append(mi_nvme)
 
     menu.append(Gtk.SeparatorMenuItem())
 
@@ -1528,6 +1627,7 @@ def run_indicator() -> None:
         "gpu": mi_gpu,
         "dram": mi_dram,
         "ups": mi_ups,
+        "nvme": mi_nvme,
         "session": mi_session,
         "today": mi_today,
         "monthly": mi_monthly,
@@ -1544,6 +1644,7 @@ def run_indicator() -> None:
         indicator.set_label(f"\u26a1 ${costs['monthly_cost']:.0f}/mo", "")
 
         p = store.last.get("power", {}) if store.last else {}
+        t = store.last.get("temps", {}) if store.last else {}
         rapl_cpu = next(
             (v for k, v in p.items() if k.startswith("rapl_") and "package" in k), None
         )
@@ -1554,10 +1655,28 @@ def run_indicator() -> None:
         gpu_total = sum(float(p[k]) for k in gpu_keys if isinstance(p[k], (int, float)))
         ups_w = ups_watts(read_apc_ups()) or 0
 
-        refs["cpu"].set_label(f"CPU: {cpu_w:.0f} W")
-        refs["gpu"].set_label(f"GPU: {gpu_total:.0f} W")
+        cpu_temp = t.get("cpu")
+        cpu_label = f"CPU: {cpu_w:.0f} W"
+        if cpu_temp is not None:
+            cpu_label += f"  {cpu_temp:.0f}\u00b0C"
+
+        gpu_temp_str = ""
+        first_gpu_temp = next(
+            (t[k] for k in sorted(t) if k.startswith("gpu") and t[k] is not None), None
+        )
+        if first_gpu_temp is not None:
+            gpu_temp_str = f"  {first_gpu_temp:.0f}\u00b0C"
+
+        nvme_temp = t.get("nvme")
+        nvme_label = "NVMe: ---\u00b0C"
+        if nvme_temp is not None:
+            nvme_label = f"NVMe: {nvme_temp:.0f}\u00b0C"
+
+        refs["cpu"].set_label(cpu_label)
+        refs["gpu"].set_label(f"GPU: {gpu_total:.0f} W{gpu_temp_str}")
         refs["dram"].set_label(f"DRAM: {dram_w:.0f} W")
         refs["ups"].set_label(f"UPS: {ups_w:.0f} W")
+        refs["nvme"].set_label(nvme_label)
         refs["session"].set_label(f"Session: ${costs['session_cost']:.2f}")
         refs["today"].set_label(f"Today: ${costs['today_cost']:.2f}")
         refs["monthly"].set_label(f"Monthly: ${costs['monthly_cost']:.1f}")
