@@ -1655,28 +1655,20 @@ def run_indicator() -> None:
             s = 64
             img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
-            cx, cy = s // 2, s // 2
-            r = 12
-            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 255))
-            draw.rectangle(
-                [cx - 3, cy + r, cx + 3, cy + r + 8], fill=(255, 200, 0, 255)
-            )
-            draw.rectangle(
-                [cx - 8, cy + r + 3, cx + 8, cy + r + 6], fill=(80, 80, 80, 255)
-            )
             try:
                 font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14
                 )
             except (IOError, OSError):
                 font = ImageFont.load_default()
-            txt = f"${cost:.1f}"
+            txt = f"\u26a1${cost:.0f}"
             bbox = draw.textbbox((0, 0), txt, font=font)
             tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
             draw.text(
-                ((s - tw) / 2, cy + r + 10),
+                ((s - tw) / 2, (s - th) / 2),
                 txt,
-                fill=(255, 255, 255, 255),
+                fill=(255, 200, 0, 255),
                 font=font,
             )
             return img
@@ -1684,22 +1676,7 @@ def run_indicator() -> None:
         def _update_icon_data(icon: pystray.Icon) -> None:
             costs = calc_costs(store)
             icon.icon = _create_icon(costs["monthly_cost"])
-            p = store.last.get("power", {}) if store.last else {}
-            t = store.last.get("temps", {}) if store.last else {}
-            total = store.last.get("total", 0) if store.last else 0
-            ups = ups_watts(read_apc_ups()) or 0
-            cpu_temp = t.get("cpu")
-            gpu0_temp = t.get("gpu0")
-            temp_str = ""
-            if cpu_temp is not None:
-                temp_str += f" CPU {cpu_temp:.0f}\u00b0C"
-            if gpu0_temp is not None:
-                temp_str += f" GPU {gpu0_temp:.0f}\u00b0C"
-            icon.title = (
-                f"\u26a1 {total:.0f} W  |  UPS {ups:.0f} W{temp_str}\n"
-                f"Session: ${costs['session_cost']:.2f}  |  "
-                f"Monthly: ${costs['monthly_cost']:.1f}"
-            )
+            icon.title = f"\u26a1 ${costs['monthly_cost']:.0f}/mo"
 
         def _on_quit(item):
             collector.stop()
