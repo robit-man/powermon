@@ -715,16 +715,11 @@ def discover_rate() -> tuple[float | None, str]:
 
     Order of precedence:
       1. POWER_RATE env var (already loaded into MUNICIPAL_RATE)
-      2. Built-in state/city rate table
-      3. Omnius web search (if OMNIUS_API_KEY set in env)
+      2. Omnius web search (always, if OMNIUS_API_KEY set)
+      3. Built-in state/city rate table (fallback)
       4. Default fallback (CA average, $0.3375)
     """
     location = _detect_location()
-
-    if location:
-        rate, src = _lookup_rate_builtin(location)
-        if rate is not None:
-            return rate, src
 
     key = _omnius_key()
     if key:
@@ -733,6 +728,11 @@ def discover_rate() -> tuple[float | None, str]:
             if rate is not None:
                 return rate, src
         rate, src = _discover_rate_via_omnius("California")
+        if rate is not None:
+            return rate, src
+
+    if location:
+        rate, src = _lookup_rate_builtin(location)
         if rate is not None:
             return rate, src
 
