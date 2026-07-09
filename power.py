@@ -43,7 +43,7 @@ import warnings
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock, Thread, Event
+from threading import Lock, Thread, Event, Timer
 from typing import Any
 
 # ── VENV BOOTSTRAP ──────────────────────────────────────────────────────────
@@ -1705,13 +1705,12 @@ def run_indicator() -> None:
             collector.stop()
             icon.stop()
 
-        def _update_loop(icon: pystray.Icon) -> None:
-            while True:
-                time.sleep(60)
-                try:
-                    _update_icon_data(icon)
-                except Exception:
-                    pass
+        def _pystray_tick(icon: pystray.Icon) -> None:
+            try:
+                _update_icon_data(icon)
+            except Exception:
+                pass
+            Timer(5, _pystray_tick, [icon]).start()
 
         icon = pystray.Icon(
             "power-monitor",
@@ -1719,7 +1718,7 @@ def run_indicator() -> None:
             menu=pystray.Menu(pystray.MenuItem("Quit", _on_quit)),
         )
         _update_icon_data(icon)
-        Thread(target=lambda: _update_loop(icon), daemon=True).start()
+        Timer(5, _pystray_tick, [icon]).start()
         icon.run()
         return
 
@@ -1860,7 +1859,7 @@ def run_indicator() -> None:
         return True
 
     _update()
-    GLib.timeout_add_seconds(60, _update)
+    GLib.timeout_add_seconds(5, _update)
     Gtk.main()
 
 
