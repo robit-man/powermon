@@ -1706,7 +1706,7 @@ def run_indicator() -> None:
 
     indicator = AppIndicator3.Indicator.new(
         "power-monitor",
-        "utilities-system-monitor",
+        "",
         AppIndicator3.IndicatorCategory.HARDWARE,
     )
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
