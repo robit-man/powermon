@@ -59,7 +59,6 @@ REQUIRED_PKGS = [
     "textual>=2",
     "psutil>=6",
     "plotext>=5",
-    "pystray>=0.19",
     "pillow>=10",
     "httpx>=0.28",
 ]
@@ -78,7 +77,9 @@ def _bootstrap_venv() -> None:
         return
     if not VENV_PATH.exists():
         old = os.umask(0o022)
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_PATH)])
+        subprocess.check_call(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(VENV_PATH)]
+        )
         os.umask(old)
     subprocess.check_call([str(VENV_PIP), "install", "-q", "--upgrade", "pip"])
     for pkg in REQUIRED_PKGS:
@@ -992,7 +993,7 @@ class Collector:
         power["total"] = total
 
         for comp, w in power.items():
-            if comp in ("cpu_pct", "ups", "total"):
+            if comp == "cpu_pct":
                 continue
             if isinstance(w, (int, float)):
                 store.cum_joules[comp] += w * self.interval
@@ -1109,47 +1110,51 @@ Screen { background: $surface; }
 #outer { height: 100%; }
 
 #metrics-box {
-    height: 9; min-height: 9;
+    height: auto; max-height: 8;
     border: round $primary;
 }
-#metrics-box > Static { width: 100%; height: 100%; }
 
-#middle-row { height: 1fr; min-height: 12; }
+#middle-row { height: 1fr; min-height: 8; }
 
 #graph-box {
     width: 1fr;
     border: round $primary;
+    overflow-x: hidden;
 }
-#graph-box > Static { width: 100%; height: 100%; }
 
 #cost-box {
-    width: 40; min-width: 32;
+    width: auto; min-width: 30; max-width: 38;
     border: round $primary;
     margin-left: 1;
 }
-#cost-box > Static { width: 100%; height: 100%; }
 
 #ups-box {
-    height: 5; min-height: 5;
+    height: auto;
     border: round $primary;
     margin-top: 1;
 }
-#ups-box > Static { width: 100%; height: 100%; }
 
 #rate-box {
-    height: 3; min-height: 3;
+    height: auto;
     border: round $accent;
     margin-top: 1;
 }
-#rate-box > Static { width: 100%; height: 100%; }
-
-.footer-text { text-style: bold; }
 """
+
+# Height threshold for pagination mode
+PAGINATE_HEIGHT = 22
 
 
 class PowerTUI(App):
     TITLE = "\u26a1 Power Monitor"
     CSS = CSS
+    BINDINGS = [
+        ("1", "page(1)"),
+        ("2", "page(2)"),
+        ("3", "page(3)"),
+        ("left", "page(1)"),
+        ("right", "page(2)"),
+    ]
 
     def __init__(
         self, collector: Collector, store: DataStore, rate_source: str = ""
@@ -1159,6 +1164,7 @@ class PowerTUI(App):
         self.store = store
         self.ups_data: dict[str, str] = {}
         self.rate_source = rate_source
+        self._page = 1
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1182,6 +1188,12 @@ class PowerTUI(App):
 
     def _poll_ups(self) -> None:
         self.ups_data = read_apc_ups()
+
+    def action_page(self, n: int) -> None:
+        self._page = n
+
+    def _paginate(self) -> bool:
+        return self.size.height < PAGINATE_HEIGHT
 
     def _metrics_content(self) -> str:
         last = self.store.last
@@ -1215,50 +1227,62 @@ class PowerTUI(App):
         elapsed_str = str(timedelta(seconds=int(elapsed_s)))
         costs = calc_costs(self.store)
 
-        lines = ["\n"]
-        line1 = (
-            f"  \u2503  CPU  {cpu_w:>6.1f} W  ({cpu_src})  "
-            f"\u2503  DRAM {dram_w:>5.1f} W  ({dram_src})  "
-            f"\u2503  GPU  {gpu_total:>6.1f} W  ({gpu_src})  "
+        parts: list[str] = []
+        parts.append(
+            f" CPU {cpu_w:>5.1f} W ({cpu_src})  DRAM {dram_w:>4.1f} W ({dram_src})"
         )
-        if ups_w is not None:
-            line1 += f"\u2503  UPS  {ups_w:>5.0f} W  \u2503"
-        lines.append(line1)
-
-        sep = f"  \u2503{'\u2500' * (len(line1) - 4)}\u2503"
-        lines.append(sep)
-
-        lines.append(
-            f"  \u2503  TOTAL  {total:>7.1f} W        "
-            f"  {costs['cum_kwh']:.3f} kWh        "
-            f"  ${costs['session_cost']:.3f} session  \u2503"
+        parts.append(
+            f" GPU {gpu_total:>5.1f} W ({gpu_src})"
+            + (f"  UPS {ups_w:>4.0f} W" if ups_w is not None else "")
         )
-        lines.append(f"  \u2503{'':>{len(line1) - 4}}\u2503")
-        lines.append(
-            f"  \u2503  elapsed {elapsed_str:>12s}        "
-            f"  rate ${MUNICIPAL_RATE:.2f}/kWh"
-            f"{'':>{max(0, len(line1) - 56)}}\u2503"
+        parts.append(
+            f" TOTAL {total:>5.1f} W  "
+            f"{costs['cum_kwh']:.2f} kWh  "
+            f"${costs['session_cost']:.2f}  "
+            f"{elapsed_str}"
         )
-        lines.append("")
-        return "\n".join(lines)
+        parts.append(f" rate ${MUNICIPAL_RATE:.2f}/kWh")
+        return "\n".join("  " + p for p in parts)
 
     def _graph_content(self) -> str:
         samples = self.store.samples
-        w = max(20, self.size.width - 12) if self.size and self.size.width else 60
-        return render_graph(samples, w)
+        if len(samples) < 2:
+            return "\n  collecting data\u2026\n"
+        try:
+            box = self.query_one("#graph-box")
+            w = box.content_region.width - 6 if box.content_region.width > 10 else 20
+        except Exception:
+            w = 40
+        totals = [float(s.get("total", 0) or 0) for s in samples]
+        data_w = max(w, 10)
+        line = _sparkline(totals, data_w)
+        mn, mx = min(totals), max(totals)
+        avg = sum(totals) / len(totals)
+        cur = totals[-1]
+        txt = (
+            f"  Current: {cur:>6.1f} W  Min: {mn:>6.1f} W  "
+            f"Max: {mx:>6.1f} W  Avg: {avg:>6.1f} W\n"
+            f"  {line}\n"
+        )
+        if len(samples) >= 2:
+            t0 = datetime.fromtimestamp(samples[0].get("ts", 0))
+            t1 = datetime.fromtimestamp(samples[-1].get("ts", 0))
+            txt += f"  {t0.strftime('%H:%M')}{' ' * max(0, data_w - 16)}{t1.strftime('%H:%M')}\n"
+        return txt
 
     def _cost_content(self) -> str:
         costs = calc_costs(self.store)
-        return (
-            "\n"
-            f"  Municipal rate\n"
-            f"  ${MUNICIPAL_RATE:.3f} / kWh\n"
-            "\n"
-            f"  Session     ${costs['session_cost']:>7.3f}\n"
-            f"  Today       ${costs['today_cost']:>7.3f}\n"
-            f"  Projected\n"
-            f"    monthly   ${costs['monthly_cost']:>7.2f}\n"
-            f"    annual    ${costs['annual_cost']:>7.2f}\n"
+        return "\n".join(
+            [
+                "",
+                "  Rate ${:.3f}/kWh".format(MUNICIPAL_RATE),
+                "",
+                "  Session  ${:.3f}".format(costs["session_cost"]),
+                "  Today    ${:.3f}".format(costs["today_cost"]),
+                "  Monthly  ${:.2f}".format(costs["monthly_cost"]),
+                "  Annual   ${:.2f}".format(costs["annual_cost"]),
+                "",
+            ]
         )
 
     def _ups_content(self) -> str:
@@ -1270,32 +1294,33 @@ class PowerTUI(App):
         load_str = d.get("LOADPCT", "\u2014")
         nom_str = d.get("NOMPOWER", "\u2014")
         if load_str == "\u2014" or nom_str == "\u2014":
-            ups_power = f"  {model:<20} "
+            ups_power = model
         else:
-            ups_power = f"  Load: {load_str:<18}  Rating: {nom_str}"
+            ups_power = f"Load {load_str}  Rating {nom_str}"
         return (
-            "\n"
-            f"  UPS: {status:<14}  Batt: {bcharge:<10}  "
-            f"Time: {timeleft:<10}\n"
-            f"{ups_power}\n"
+            f"  UPS: {status:<12}  Batt: {bcharge:<8}  "
+            f"Time: {timeleft:<8}  {ups_power}\n"
         )
 
     def _rate_content(self) -> str:
-        src = self.rate_source[:50] if self.rate_source else "default"
+        src = self.rate_source[:45] if self.rate_source else "default"
         return (
-            "\n"
-            f"  Rate source: {src:<50}\n"
-            f"  Rate: ${MUNICIPAL_RATE:.4f}/kWh    "
-            f"Update via: POWER_RATE=<rate> ./power.py  or  ./power.py --fetch-rate\n"
+            f"  Rate source: {src:<45}\n"
+            f"  ${MUNICIPAL_RATE:.4f}/kWh  "
+            "POWER_RATE=<rate> ./power.py  |  ./power.py --fetch-rate\n"
         )
 
     def update_ui(self) -> None:
         try:
-            self.query_one("#metrics-box").update(self._metrics_content())
-            self.query_one("#graph-box").update(self._graph_content())
-            self.query_one("#cost-box").update(self._cost_content())
-            self.query_one("#ups-box").update(self._ups_content())
-            self.query_one("#rate-box").update(self._rate_content())
+            page = self._page if self._paginate() else 0
+            if page == 0 or page == 1:
+                self.query_one("#metrics-box").update(self._metrics_content())
+                self.query_one("#graph-box").update(self._graph_content())
+            if page == 0 or page == 2:
+                self.query_one("#cost-box").update(self._cost_content())
+            if page == 0 or page == 3:
+                self.query_one("#ups-box").update(self._ups_content())
+                self.query_one("#rate-box").update(self._rate_content())
         except Exception:
             pass
 
@@ -1341,75 +1366,210 @@ def run_daemon() -> None:
 
 
 def run_indicator() -> None:
-    try:
-        import pystray
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError as exc:
-        print(f"pystray not available: {exc}")
-        sys.exit(1)
+    """GNOME top bar indicator using AyatanaAppIndicator3, with pystray fallback."""
 
+    _try_ayatana = True
+    try:
+        import gi
+
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+        from gi.repository import GLib, Gtk
+    except (ImportError, ValueError):
+        _try_ayatana = False
+
+    if not _try_ayatana:
+        try:
+            import pystray
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as exc:
+            print(f"Indicator requires AyatanaAppIndicator3 or pystray: {exc}")
+            sys.exit(1)
+
+        store.load_history(DAEMON_DATA)
+
+        def _create_icon(cost: float) -> Image.Image:
+            s = 64
+            img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            cx, cy = s // 2, s // 2
+            r = 12
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 255))
+            draw.rectangle(
+                [cx - 3, cy + r, cx + 3, cy + r + 8], fill=(255, 200, 0, 255)
+            )
+            draw.rectangle(
+                [cx - 8, cy + r + 3, cx + 8, cy + r + 6], fill=(80, 80, 80, 255)
+            )
+            try:
+                font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11
+                )
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+            txt = f"${cost:.1f}"
+            bbox = draw.textbbox((0, 0), txt, font=font)
+            tw = bbox[2] - bbox[0]
+            draw.text(
+                ((s - tw) / 2, cy + r + 10),
+                txt,
+                fill=(255, 255, 255, 255),
+                font=font,
+            )
+            return img
+
+        def _update_icon_data(icon: pystray.Icon) -> None:
+            store.load_history(DAEMON_DATA)
+            c = Collector()
+            c._sample(time.time())
+            c.stop()
+            costs = calc_costs(store)
+            icon.icon = _create_icon(costs["monthly_cost"])
+            p = store.last.get("power", {}) if store.last else {}
+            total = store.last.get("total", 0) if store.last else 0
+            ups = ups_watts(read_apc_ups()) or 0
+            icon.title = (
+                f"\u26a1 {total:.0f} W  |  UPS {ups:.0f} W\n"
+                f"Session: ${costs['session_cost']:.2f}  |  "
+                f"Monthly: ${costs['monthly_cost']:.1f}"
+            )
+
+        def _on_quit(item):
+            icon.stop()
+
+        def _update_loop(icon: pystray.Icon) -> None:
+            while True:
+                time.sleep(60)
+                try:
+                    _update_icon_data(icon)
+                except Exception:
+                    pass
+
+        icon = pystray.Icon(
+            "power-monitor",
+            _create_icon(0),
+            menu=pystray.Menu(pystray.MenuItem("Quit", _on_quit)),
+        )
+        _update_icon_data(icon)
+        Thread(target=lambda: _update_loop(icon), daemon=True).start()
+        icon.run()
+        return
+
+    # ── AyatanaAppIndicator3 ────────────────────────────────────────────
     store.load_history(DAEMON_DATA)
 
-    def _create_icon(cost: float) -> Image.Image:
-        s = 64
-        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        cx, cy = s // 2, s // 2
-        r = 12
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 200, 0, 255))
-        draw.rectangle([cx - 3, cy + r, cx + 3, cy + r + 8], fill=(255, 200, 0, 255))
-        draw.rectangle([cx - 8, cy + r + 3, cx + 8, cy + r + 6], fill=(80, 80, 80, 255))
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11
-            )
-        except (IOError, OSError):
-            font = ImageFont.load_default()
-        txt = f"${cost:.1f}"
-        bbox = draw.textbbox((0, 0), txt, font=font)
-        tw = bbox[2] - bbox[0]
-        draw.text(
-            ((s - tw) / 2, cy + r + 10), txt, fill=(255, 255, 255, 255), font=font
-        )
-        return img
+    indicator = AppIndicator3.Indicator.new(
+        "power-monitor",
+        "utilities-system-monitor",
+        AppIndicator3.IndicatorCategory.HARDWARE,
+    )
+    indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
 
-    def _update_icon_data(icon: pystray.Icon) -> None:
+    menu = Gtk.Menu()
+
+    mi_title = Gtk.MenuItem(label="Power Monitor")
+    mi_title.set_sensitive(False)
+    menu.append(mi_title)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    mi_cpu = Gtk.MenuItem(label="CPU: --- W")
+    mi_cpu.set_sensitive(False)
+    menu.append(mi_cpu)
+
+    mi_gpu = Gtk.MenuItem(label="GPU: --- W")
+    mi_gpu.set_sensitive(False)
+    menu.append(mi_gpu)
+
+    mi_dram = Gtk.MenuItem(label="DRAM: --- W")
+    mi_dram.set_sensitive(False)
+    menu.append(mi_dram)
+
+    mi_ups = Gtk.MenuItem(label="UPS: --- W")
+    mi_ups.set_sensitive(False)
+    menu.append(mi_ups)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    mi_session = Gtk.MenuItem(label="Session: $---")
+    mi_session.set_sensitive(False)
+    menu.append(mi_session)
+
+    mi_today = Gtk.MenuItem(label="Today: $---")
+    mi_today.set_sensitive(False)
+    menu.append(mi_today)
+
+    mi_monthly = Gtk.MenuItem(label="Monthly: $---")
+    mi_monthly.set_sensitive(False)
+    menu.append(mi_monthly)
+
+    mi_annual = Gtk.MenuItem(label="Annual: $---")
+    mi_annual.set_sensitive(False)
+    menu.append(mi_annual)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    mi_rate = Gtk.MenuItem(label="Rate: $---/kWh")
+    mi_rate.set_sensitive(False)
+    menu.append(mi_rate)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    mi_quit = Gtk.MenuItem(label="Quit")
+    mi_quit.connect("activate", lambda *a: Gtk.main_quit())
+    menu.append(mi_quit)
+
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    refs = {
+        "cpu": mi_cpu,
+        "gpu": mi_gpu,
+        "dram": mi_dram,
+        "ups": mi_ups,
+        "session": mi_session,
+        "today": mi_today,
+        "monthly": mi_monthly,
+        "annual": mi_annual,
+        "rate": mi_rate,
+    }
+
+    def _update() -> bool:
         store.load_history(DAEMON_DATA)
-        # Grab one fresh sample
         c = Collector()
         c._sample(time.time())
         c.stop()
+
         costs = calc_costs(store)
-        img = _create_icon(costs["monthly_cost"])
-        icon.icon = img
+
+        indicator.set_label(f"\u26a1 ${costs['monthly_cost']:.0f}/mo", "")
+
         p = store.last.get("power", {}) if store.last else {}
-        total = store.last.get("total", 0) if store.last else 0
-        ups = ups_watts(read_apc_ups()) or 0
-        icon.title = (
-            f"\u26a1 {total:.0f} W  |  UPS {ups:.0f} W\n"
-            f"Session: ${costs['session_cost']:.2f}  |  "
-            f"Monthly: ${costs['monthly_cost']:.1f}"
+        rapl_cpu = next(
+            (v for k, v in p.items() if k.startswith("rapl_") and "package" in k), None
         )
+        cpu_w = rapl_cpu if rapl_cpu is not None else p.get("cpu_est", 0)
+        rapl_dram = next((v for k, v in p.items() if k == "rapl_dram"), None)
+        dram_w = rapl_dram if rapl_dram is not None else p.get("dram_est", 0)
+        gpu_keys = sorted(k for k in p if k.startswith("gpu"))
+        gpu_total = sum(float(p[k]) for k in gpu_keys if isinstance(p[k], (int, float)))
+        ups_w = ups_watts(read_apc_ups()) or 0
 
-    def _on_quit(item):
-        icon.stop()
+        refs["cpu"].set_label(f"CPU: {cpu_w:.0f} W")
+        refs["gpu"].set_label(f"GPU: {gpu_total:.0f} W")
+        refs["dram"].set_label(f"DRAM: {dram_w:.0f} W")
+        refs["ups"].set_label(f"UPS: {ups_w:.0f} W")
+        refs["session"].set_label(f"Session: ${costs['session_cost']:.2f}")
+        refs["today"].set_label(f"Today: ${costs['today_cost']:.2f}")
+        refs["monthly"].set_label(f"Monthly: ${costs['monthly_cost']:.1f}")
+        refs["annual"].set_label(f"Annual: ${costs['annual_cost']:.0f}")
+        refs["rate"].set_label(f"Rate: ${MUNICIPAL_RATE:.3f}/kWh")
 
-    def _update_loop(icon: pystray.Icon) -> None:
-        while True:
-            time.sleep(60)
-            try:
-                _update_icon_data(icon)
-            except Exception:
-                pass
+        return True
 
-    icon = pystray.Icon(
-        "power-monitor",
-        _create_icon(0),
-        menu=pystray.Menu(pystray.MenuItem("Quit", _on_quit)),
-    )
-    _update_icon_data(icon)
-    Thread(target=lambda: _update_loop(icon), daemon=True).start()
-    icon.run()
+    _update()
+    GLib.timeout_add_seconds(60, _update)
+    Gtk.main()
 
 
 # ══════════════════════════════════════════════════════════════════════════
