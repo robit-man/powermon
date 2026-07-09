@@ -642,13 +642,14 @@ def _omnius_chat(model: str, messages: list[dict]) -> str | None:
 
 
 _OMNIUS_MODEL_CANDIDATES = [
-    "local/omnius-qwen36-35b",
+    "local/qwen3.5:9b",
     "local/omnius-qwen36-27b",
-    "local/qwen3.6:35b",
     "local/qwen3.6:27b",
+    "local/omnius-qwen36-35b",
+    "local/qwen3.6:35b",
     "local/omnius-open-agents-qwen36",
     "local/ornith-1.0-35b-tools:q4km",
-    "local/qwen3.5:9b",
+    "local/qwen3:8b",
 ]
 
 
@@ -689,7 +690,12 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
     for line in resp.splitlines():
         if line.startswith("RATE="):
             try:
-                rate = float(line.split("=", 1)[1].strip().replace("$", ""))
+                val = line.split("=", 1)[1].strip().replace("$", "")
+                import re as _re
+
+                m = _re.search(r"(\d+\.?\d*)", val)
+                if m:
+                    rate = float(m.group(1))
             except (ValueError, IndexError):
                 pass
         if line.startswith("UTILITY="):
