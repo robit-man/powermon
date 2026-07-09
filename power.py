@@ -23,6 +23,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import fcntl
 import glob
@@ -116,7 +117,8 @@ import httpx
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal
-from textual.widgets import Header, Footer, Static
+from textual.widgets import Header, Static, Footer
+from textual.command import Provider, Hit, Hits
 from rich.text import Text
 
 # ── OMNIUS BOOTSTRAP ────────────────────────────────────────────────────────
@@ -1193,9 +1195,127 @@ Screen { background: $surface; }
 PAGINATE_HEIGHT = 22
 
 
+class PowerCommands(Provider):
+    """Command palette provider for daemon & indicator controls."""
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+
+        def _toggle_indicator() -> None:
+            self.app.action_toggle_indicator()
+
+        yield Hit(
+            matcher.match("toggle indicator"),
+            "Toggle system-tray indicator",
+            _toggle_indicator,
+            help="Start or stop the system-tray monthly-cost indicator",
+        )
+
+        async def _daemon_status() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl",
+                    "is-active",
+                    SERVICE_NAME,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                active = stdout.decode().strip() == "active"
+                self.app.notify(
+                    f"\u25cf Daemon is {'active' if active else 'not running'}",
+                    timeout=3,
+                )
+            except Exception:
+                self.app.notify("Could not check daemon status", timeout=3)
+
+        yield Hit(
+            matcher.match("daemon status"),
+            "Show daemon status",
+            _daemon_status,
+            help="Check if the power-monitor systemd service is running",
+        )
+
+        async def _start_daemon() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo",
+                    "systemctl",
+                    "start",
+                    SERVICE_NAME,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    self.app.notify("Daemon started", timeout=3)
+                else:
+                    self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
+            except Exception as e:
+                self.app.notify(f"Error: {e}", timeout=5)
+
+        yield Hit(
+            matcher.match("start daemon"),
+            "Start daemon  \u23f5",
+            _start_daemon,
+            help="Start power-monitor systemd service (requires sudo)",
+        )
+
+        async def _stop_daemon() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo",
+                    "systemctl",
+                    "stop",
+                    SERVICE_NAME,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    self.app.notify("Daemon stopped", timeout=3)
+                else:
+                    self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
+            except Exception as e:
+                self.app.notify(f"Error: {e}", timeout=5)
+
+        yield Hit(
+            matcher.match("stop daemon"),
+            "Stop daemon  \u23f9",
+            _stop_daemon,
+            help="Stop power-monitor systemd service (requires sudo)",
+        )
+
+        async def _restart_daemon() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo",
+                    "systemctl",
+                    "restart",
+                    SERVICE_NAME,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    self.app.notify("Daemon restarted", timeout=3)
+                else:
+                    self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
+            except Exception as e:
+                self.app.notify(f"Error: {e}", timeout=5)
+
+        yield Hit(
+            matcher.match("restart daemon"),
+            "Restart daemon  \u21bb",
+            _restart_daemon,
+            help="Restart power-monitor systemd service (requires sudo)",
+        )
+
+
 class PowerTUI(App):
     TITLE = "\u26a1 Power Monitor"
     CSS = CSS
+    COMMANDS = {PowerCommands}
     BINDINGS = [
         ("1", "page(1)"),
         ("2", "page(2)"),
@@ -1203,6 +1323,7 @@ class PowerTUI(App):
         ("left", "page(1)"),
         ("right", "page(2)"),
         ("i", "toggle_indicator"),
+        ("ctrl+p", "command_palette"),
     ]
 
     def __init__(
@@ -1240,8 +1361,11 @@ class PowerTUI(App):
         self._poll_ups()
         if not self.store.samples:
             n = self.store.load_history(DAEMON_DATA)
-            if n:
-                self.log.info(f"Loaded {n} historical samples from daemon")
+            if n and self.store.samples:
+                last = self.store.samples[-1].get("cum_kwh", {})
+                if isinstance(last, dict):
+                    for k, v in last.items():
+                        self.store.cum_joules[k] = v * 3_600_000.0
         if not self._no_fetch:
             Thread(target=self._discover_rate, daemon=True).start()
 
@@ -1384,6 +1508,21 @@ class PowerTUI(App):
             t0 = datetime.fromtimestamp(samples[0].get("ts", 0))
             t1 = datetime.fromtimestamp(samples[-1].get("ts", 0))
             txt += f"  {t0.strftime('%H:%M')}{' ' * max(0, data_w - 16)}{t1.strftime('%H:%M')}\n"
+
+        # Accumulated cost sparkline
+        costs = [
+            float(s.get("cum_kwh", {}).get("total", 0) or 0) * MUNICIPAL_RATE
+            for s in samples
+        ]
+        if any(c > 0 for c in costs):
+            cost_line = _sparkline(costs, data_w)
+            cur_cost = costs[-1]
+            proj = calc_costs(self.store)
+            txt += (
+                f"\n  Cost: ${cur_cost:.4f}  Month: ${proj['monthly_cost']:.2f}  "
+                f"Year: ${proj['annual_cost']:.2f}\n"
+                f"  {cost_line}\n"
+            )
         return txt
 
     def _cost_content(self) -> str:
