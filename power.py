@@ -1387,6 +1387,8 @@ def run_indicator() -> None:
             sys.exit(1)
 
         store.load_history(DAEMON_DATA)
+        collector = Collector()
+        collector.start()
 
         def _create_icon(cost: float) -> Image.Image:
             s = 64
@@ -1419,10 +1421,6 @@ def run_indicator() -> None:
             return img
 
         def _update_icon_data(icon: pystray.Icon) -> None:
-            store.load_history(DAEMON_DATA)
-            c = Collector()
-            c._sample(time.time())
-            c.stop()
             costs = calc_costs(store)
             icon.icon = _create_icon(costs["monthly_cost"])
             p = store.last.get("power", {}) if store.last else {}
@@ -1435,6 +1433,7 @@ def run_indicator() -> None:
             )
 
         def _on_quit(item):
+            collector.stop()
             icon.stop()
 
         def _update_loop(icon: pystray.Icon) -> None:
@@ -1457,10 +1456,12 @@ def run_indicator() -> None:
 
     # ── AyatanaAppIndicator3 ────────────────────────────────────────────
     store.load_history(DAEMON_DATA)
+    collector = Collector()
+    collector.start()
 
     indicator = AppIndicator3.Indicator.new(
         "power-monitor",
-        "utilities-system-monitor",
+        "",
         AppIndicator3.IndicatorCategory.HARDWARE,
     )
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -1516,7 +1517,7 @@ def run_indicator() -> None:
     menu.append(Gtk.SeparatorMenuItem())
 
     mi_quit = Gtk.MenuItem(label="Quit")
-    mi_quit.connect("activate", lambda *a: Gtk.main_quit())
+    mi_quit.connect("activate", lambda *a: _on_quit())
     menu.append(mi_quit)
 
     menu.show_all()
@@ -1534,14 +1535,12 @@ def run_indicator() -> None:
         "rate": mi_rate,
     }
 
+    def _on_quit() -> None:
+        collector.stop()
+        Gtk.main_quit()
+
     def _update() -> bool:
-        store.load_history(DAEMON_DATA)
-        c = Collector()
-        c._sample(time.time())
-        c.stop()
-
         costs = calc_costs(store)
-
         indicator.set_label(f"\u26a1 ${costs['monthly_cost']:.0f}/mo", "")
 
         p = store.last.get("power", {}) if store.last else {}
