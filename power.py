@@ -1240,7 +1240,7 @@ class PowerCommands(Provider):
             try:
                 if not SERVICE_FILE.exists():
                     proc = await asyncio.create_subprocess_exec(
-                        "sudo",
+                        "pkexec",
                         str(VENV_PYTHON),
                         str(SCRIPT_DIR / "power.py"),
                         "--install-service",
@@ -1256,7 +1256,7 @@ class PowerCommands(Provider):
                         )
                 else:
                     proc = await asyncio.create_subprocess_exec(
-                        "sudo",
+                        "pkexec",
                         "systemctl",
                         "start",
                         SERVICE_NAME,
@@ -1275,13 +1275,13 @@ class PowerCommands(Provider):
             matcher.match("start daemon"),
             "Start daemon  \u23f5",
             _start_daemon,
-            help="Start power-monitor systemd service (requires sudo)",
+            help="Start power-monitor systemd service",
         )
 
         async def _stop_daemon() -> None:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "sudo",
+                    "pkexec",
                     "systemctl",
                     "stop",
                     SERVICE_NAME,
@@ -1300,14 +1300,14 @@ class PowerCommands(Provider):
             matcher.match("stop daemon"),
             "Stop daemon  \u23f9",
             _stop_daemon,
-            help="Stop power-monitor systemd service (requires sudo)",
+            help="Stop power-monitor systemd service",
         )
 
         async def _restart_daemon() -> None:
             try:
                 if not SERVICE_FILE.exists():
                     proc = await asyncio.create_subprocess_exec(
-                        "sudo",
+                        "pkexec",
                         str(VENV_PYTHON),
                         str(SCRIPT_DIR / "power.py"),
                         "--install-service",
@@ -1323,7 +1323,7 @@ class PowerCommands(Provider):
                         )
                 else:
                     proc = await asyncio.create_subprocess_exec(
-                        "sudo",
+                        "pkexec",
                         "systemctl",
                         "restart",
                         SERVICE_NAME,
