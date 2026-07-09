@@ -1339,7 +1339,6 @@ class PowerTUI(App):
         self.ups_data: dict[str, str] = {}
         self.rate_source = rate_source
         self._page = 1
-        self._indicator_proc: subprocess.Popen | None = None
         self._no_fetch = no_fetch
         self._rate_phase: str = "init"
         self._rate_msg: str = ""
@@ -1370,9 +1369,7 @@ class PowerTUI(App):
             Thread(target=self._discover_rate, daemon=True).start()
 
     def on_unmount(self) -> None:
-        if self._indicator_proc is not None and self._indicator_proc.poll() is None:
-            self._indicator_proc.terminate()
-            self._indicator_proc = None
+        pass
 
     def _poll_ups(self) -> None:
         self.ups_data = read_apc_ups()
@@ -1405,19 +1402,38 @@ class PowerTUI(App):
         return self.size.height < PAGINATE_HEIGHT
 
     def action_toggle_indicator(self) -> None:
-        if self._indicator_proc is not None and self._indicator_proc.poll() is None:
-            self._indicator_proc.terminate()
-            self._indicator_proc = None
+        pid_file = USER_DATA_DIR / "indicator.pid"
+        if self._indicator_running():
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+            except (ValueError, OSError):
+                pass
+            pid_file.unlink(missing_ok=True)
             self.notify("Indicator stopped", timeout=2)
         else:
             script = Path(sys.argv[0]).resolve()
-            self._indicator_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 [str(VENV_PYTHON), str(script), "--indicator", "--no-fetch-rate"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(proc.pid))
             self.notify("Indicator started", timeout=2)
+
+    def _indicator_running(self) -> bool:
+        pid_file = USER_DATA_DIR / "indicator.pid"
+        if not pid_file.exists():
+            return False
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            return True
+        except (ValueError, OSError):
+            pid_file.unlink(missing_ok=True)
+            return False
 
     def _metrics_content(self) -> str:
         last = self.store.last
@@ -1560,7 +1576,7 @@ class PowerTUI(App):
     def _rate_content(self) -> str:
         ind = (
             "\u25c9 Indicator on  [i] toggle"
-            if self._indicator_proc is not None and self._indicator_proc.poll() is None
+            if self._indicator_running()
             else "\u25cb Indicator off  [i] toggle"
         )
         if self._rate_phase == "done":
