@@ -642,13 +642,8 @@ def _omnius_chat(model: str, messages: list[dict]) -> str | None:
 
 
 _OMNIUS_MODEL_CANDIDATES = [
+    "robit/ornith:9b",
     "local/qwen3.5:9b",
-    "local/omnius-qwen36-27b",
-    "local/qwen3.6:27b",
-    "local/omnius-qwen36-35b",
-    "local/qwen3.6:35b",
-    "local/omnius-open-agents-qwen36",
-    "local/ornith-1.0-35b-tools:q4km",
     "local/qwen3:8b",
 ]
 
@@ -661,18 +656,16 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
     Returns (rate_per_kwh, source_description) or (None, reason).
     """
     models = _omnius_models()
-    candidates = models if models else []
+    candidates = list(_OMNIUS_MODEL_CANDIDATES)
     seen = set(candidates)
-    for m in _OMNIUS_MODEL_CANDIDATES:
+    for m in models or []:
         if m not in seen:
             candidates.append(m)
             seen.add(m)
 
     if not candidates:
         return None, "omnius unavailable (no key or unreachable)"
-    preferred = [
-        m for m in candidates if "qwen3.6" in m or "ornith" in m or "qwen3" in m
-    ]
+    preferred = [m for m in candidates if "9b" in m.lower() or "8b" in m.lower()]
     model = preferred[0] if preferred else candidates[0]
 
     prompt = (
