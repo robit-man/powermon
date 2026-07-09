@@ -1238,19 +1238,36 @@ class PowerCommands(Provider):
 
         async def _start_daemon() -> None:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "sudo",
-                    "systemctl",
-                    "start",
-                    SERVICE_NAME,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    self.app.notify("Daemon started", timeout=3)
+                if not SERVICE_FILE.exists():
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo",
+                        str(VENV_PYTHON),
+                        str(SCRIPT_DIR / "power.py"),
+                        "--install-service",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode == 0:
+                        self.app.notify("Daemon installed and started", timeout=3)
+                    else:
+                        self.app.notify(
+                            f"Install failed: {stderr.decode().strip()}", timeout=5
+                        )
                 else:
-                    self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo",
+                        "systemctl",
+                        "start",
+                        SERVICE_NAME,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode == 0:
+                        self.app.notify("Daemon started", timeout=3)
+                    else:
+                        self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
             except Exception as e:
                 self.app.notify(f"Error: {e}", timeout=5)
 
@@ -1288,19 +1305,36 @@ class PowerCommands(Provider):
 
         async def _restart_daemon() -> None:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "sudo",
-                    "systemctl",
-                    "restart",
-                    SERVICE_NAME,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    self.app.notify("Daemon restarted", timeout=3)
+                if not SERVICE_FILE.exists():
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo",
+                        str(VENV_PYTHON),
+                        str(SCRIPT_DIR / "power.py"),
+                        "--install-service",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode == 0:
+                        self.app.notify("Daemon installed and started", timeout=3)
+                    else:
+                        self.app.notify(
+                            f"Install failed: {stderr.decode().strip()}", timeout=5
+                        )
                 else:
-                    self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo",
+                        "systemctl",
+                        "restart",
+                        SERVICE_NAME,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode == 0:
+                        self.app.notify("Daemon restarted", timeout=3)
+                    else:
+                        self.app.notify(f"Failed: {stderr.decode().strip()}", timeout=5)
             except Exception as e:
                 self.app.notify(f"Error: {e}", timeout=5)
 
