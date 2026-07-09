@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Omnius per-project config
+.omnius/
+
+# Generated artifacts
+power_log.csv
+power_plot.png
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
