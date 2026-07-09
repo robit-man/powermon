@@ -1206,7 +1206,11 @@ class PowerTUI(App):
     ]
 
     def __init__(
-        self, collector: Collector, store: DataStore, rate_source: str = ""
+        self,
+        collector: Collector,
+        store: DataStore,
+        rate_source: str = "",
+        no_fetch: bool = False,
     ) -> None:
         super().__init__()
         self.collector = collector
@@ -1215,6 +1219,9 @@ class PowerTUI(App):
         self.rate_source = rate_source
         self._page = 1
         self._indicator_proc: subprocess.Popen | None = None
+        self._no_fetch = no_fetch
+        self._rate_phase: str = "init"
+        self._rate_msg: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1235,6 +1242,8 @@ class PowerTUI(App):
             n = self.store.load_history(DAEMON_DATA)
             if n:
                 self.log.info(f"Loaded {n} historical samples from daemon")
+        if not self._no_fetch:
+            Thread(target=self._discover_rate, daemon=True).start()
 
     def on_unmount(self) -> None:
         if self._indicator_proc is not None and self._indicator_proc.poll() is None:
@@ -1243,6 +1252,27 @@ class PowerTUI(App):
 
     def _poll_ups(self) -> None:
         self.ups_data = read_apc_ups()
+
+    def _discover_rate(self) -> None:
+        global MUNICIPAL_RATE
+        self._rate_phase = "locating"
+        self._rate_msg = "Detecting location\u2026"
+        location = _detect_location()
+        if location:
+            self._rate_msg = f"Location: {location}"
+
+        self._rate_phase = "omnius"
+        self._rate_msg = "Querying Omnius for rates\u2026"
+        rate, src = discover_rate()
+        if rate is not None:
+            MUNICIPAL_RATE = rate
+            self.rate_source = src
+            self._rate_phase = "done"
+            self._rate_msg = f"Rate ${rate:.4f}/kWh \u2013 {src}"
+            return
+
+        self._rate_phase = "failed"
+        self._rate_msg = "Rate discovery unavailable, using default"
 
     def action_page(self, n: int) -> None:
         self._page = n
@@ -1389,12 +1419,17 @@ class PowerTUI(App):
         )
 
     def _rate_content(self) -> str:
-        src = self.rate_source[:45] if self.rate_source else "default"
         ind = (
             "\u25c9 Indicator on  [i] toggle"
             if self._indicator_proc is not None and self._indicator_proc.poll() is None
             else "\u25cb Indicator off  [i] toggle"
         )
+        if self._rate_phase == "done":
+            src = self.rate_source[:45] if self.rate_source else "default"
+            return f"  Rate source: {src:<45}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
+        spinner = "\u25d0\u25d1\u25d2\u25d3"[int(time.time() * 2) % 4]
+        msg = self._rate_msg or "Initializing\u2026"
+        return f"  {spinner} {msg:<55}\n  {'':>20} {ind}\n"
         return f"  Rate source: {src:<45}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
 
     def update_ui(self) -> None:
@@ -1834,17 +1869,10 @@ def main() -> None:
             print(f"Current rate: ${MUNICIPAL_RATE:.4f}/kWh (default)")
         sys.exit(0)
     else:
-        rate_source = "default"
-        if not args.no_fetch_rate:
-            discovered, src = discover_rate()
-            if discovered is not None:
-                MUNICIPAL_RATE = discovered
-                rate_source = src
-
         collector = Collector()
         collector.start()
         store.load_history(DAEMON_DATA)
-        app = PowerTUI(collector, store, rate_source=rate_source)
+        app = PowerTUI(collector, store, no_fetch=args.no_fetch_rate)
         try:
             app.run()
         except KeyboardInterrupt:
