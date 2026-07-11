@@ -316,6 +316,9 @@ DAEMON_DATA = SYSTEM_DATA_DIR / DATA_FILE_NAME
 SERVICE_NAME = "power-monitor"
 SERVICE_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
 
+INDICATOR_AUTOSTART_DIR = Path.home() / ".config" / "autostart"
+INDICATOR_AUTOSTART_FILE = INDICATOR_AUTOSTART_DIR / "power-monitor-indicator.desktop"
+
 CPU_TDP_ESTIMATE = 350
 
 # ── BUILT-IN RATE TABLE ─────────────────────────────────────────────────────
@@ -1729,28 +1732,23 @@ def run_indicator() -> None:
             s = 64
             img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
-            try:
-                font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14
-                )
-            except (IOError, OSError):
-                font = ImageFont.load_default()
-            txt = f"\u26a1${cost:.0f}"
-            bbox = draw.textbbox((0, 0), txt, font=font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            draw.text(
-                ((s - tw) / 2, (s - th) / 2),
-                txt,
+            draw.polygon(
+                [
+                    (32, 4),
+                    (16, 34),
+                    (28, 34),
+                    (22, 60),
+                    (48, 34),
+                    (36, 34),
+                ],
                 fill=(255, 200, 0, 255),
-                font=font,
             )
             return img
 
         def _update_icon_data(icon: pystray.Icon) -> None:
             costs = calc_costs(store)
             icon.icon = _create_icon(costs["monthly_cost"])
-            icon.title = f"\u26a1 ${costs['monthly_cost']:.0f}/mo"
+            icon.title = f"${costs['monthly_cost']:.0f}/mo"
 
         def _on_quit(item):
             collector.stop()
@@ -1789,7 +1787,7 @@ def run_indicator() -> None:
 
     indicator = AppIndicator3.Indicator.new(
         "power-monitor",
-        "",
+        "ac-adapter-symbolic",
         AppIndicator3.IndicatorCategory.HARDWARE,
     )
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -1879,7 +1877,7 @@ def run_indicator() -> None:
 
     def _update() -> bool:
         costs = calc_costs(store)
-        indicator.set_label(f"\u26a1 ${costs['monthly_cost']:.0f}/mo", "")
+        indicator.set_label(f"${costs['monthly_cost']:.0f}/mo", "")
 
         p = store.last.get("power", {}) if store.last else {}
         t = store.last.get("temps", {}) if store.last else {}
@@ -2011,6 +2009,31 @@ def show_service_status() -> None:
         print("  Data file not found")
 
 
+def install_indicator_autostart() -> None:
+    INDICATOR_AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+    INDICATOR_AUTOSTART_FILE.write_text(
+        textwrap.dedent(f"""\
+            [Desktop Entry]
+            Type=Application
+            Name=Power Monitor Indicator
+            Exec={VENV_PYTHON} {SCRIPT_DIR / "power.py"} --indicator
+            Hidden=false
+            NoDisplay=false
+            X-GNOME-Autostart-enabled=true
+        """)
+    )
+    INDICATOR_AUTOSTART_FILE.chmod(0o644)
+    print(f"\u2713 Indicator autostart installed \u2192 {INDICATOR_AUTOSTART_FILE}")
+
+
+def uninstall_indicator_autostart() -> None:
+    if INDICATOR_AUTOSTART_FILE.exists():
+        INDICATOR_AUTOSTART_FILE.unlink()
+        print(f"\u2713 Indicator autostart removed")
+    else:
+        print("Indicator autostart not installed")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════
@@ -2036,6 +2059,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--uninstall-service", action="store_true", help="Stop + remove systemd service"
+    )
+    parser.add_argument(
+        "--install-indicator-autostart",
+        action="store_true",
+        help="Register indicator to auto-start on GNOME login",
+    )
+    parser.add_argument(
+        "--uninstall-indicator-autostart",
+        action="store_true",
+        help="Remove indicator from GNOME auto-start",
     )
     parser.add_argument(
         "--status", action="store_true", help="Show service and data status"
@@ -2071,6 +2104,10 @@ def main() -> None:
         install_service()
     elif args.uninstall_service:
         uninstall_service()
+    elif args.install_indicator_autostart:
+        install_indicator_autostart()
+    elif args.uninstall_indicator_autostart:
+        uninstall_indicator_autostart()
     elif args.status:
         show_service_status()
     elif args.daemon:
