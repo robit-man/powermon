@@ -30,6 +30,7 @@ import glob
 import io
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -40,6 +41,7 @@ import termios
 import textwrap
 import time
 import warnings
+import webbrowser
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -469,7 +471,7 @@ STATE_NAMES: dict[str, str] = {
 }
 
 
-def _lookup_rate_builtin(location: str) -> tuple[float | None, str]:
+def _lookup_rate_builtin(location: str) -> tuple[float | None, str, str]:
     """Match a location string against the built-in rate table.
 
     Accepts formats like:
@@ -479,15 +481,16 @@ def _lookup_rate_builtin(location: str) -> tuple[float | None, str]:
       - 'CA'
       - 'New York'
       - 'Chicago, IL'
+    Returns (rate, source_label, source_url) — url is always '' for built-in.
     """
     loc = location.strip()
     if not loc:
-        return None, ""
+        return None, "", ""
 
     # Direct city match
     city_rates = RATE_TABLE["city"]
     if loc in city_rates:
-        return city_rates[loc], f"{loc} (built-in)"
+        return city_rates[loc], f"{loc} (built-in)", ""
 
     # Split on comma
     parts = [p.strip() for p in loc.split(",")]
@@ -499,26 +502,26 @@ def _lookup_rate_builtin(location: str) -> tuple[float | None, str]:
         abbr = state_part.upper()
         if len(abbr) == 2 and abbr in RATE_TABLE["state"]:
             if city_part in city_rates:
-                return city_rates[city_part], f"{city_part}, {abbr} (built-in)"
-            return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)"
+                return city_rates[city_part], f"{city_part}, {abbr} (built-in)", ""
+            return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)", ""
         full = state_part.lower()
         if full in STATE_NAMES:
             abbr = STATE_NAMES[full]
             if city_part in city_rates:
-                return city_rates[city_part], f"{city_part}, {abbr} (built-in)"
-            return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)"
+                return city_rates[city_part], f"{city_part}, {abbr} (built-in)", ""
+            return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)", ""
 
     # Check if the whole string is a state name
     low = loc.lower()
     if low in STATE_NAMES:
         abbr = STATE_NAMES[low]
-        return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)"
+        return RATE_TABLE["state"][abbr], f"{abbr} avg (built-in)", ""
 
     # Check if it's a 2-letter state code
     if len(loc) == 2 and loc.upper() in RATE_TABLE["state"]:
-        return RATE_TABLE["state"][loc.upper()], f"{loc.upper()} avg (built-in)"
+        return RATE_TABLE["state"][loc.upper()], f"{loc.upper()} avg (built-in)", ""
 
-    return None, ""
+    return None, "", ""
 
 
 # ── LOCATION DETECTION ───────────────────────────────────────────────────────
@@ -648,12 +651,15 @@ _OMNIUS_MODEL_CANDIDATES = [
 ]
 
 
-def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
+OMNIUS_SOURCE_URL: str = ""
+
+
+def _discover_rate_via_omnius(location: str) -> tuple[float | None, str, str]:
     """Query Omnius for electricity rate at *location*.
 
     Tries known model names directly (no models endpoint dependency),
     falling back to the models API if needed.
-    Returns (rate_per_kwh, source_description) or (None, reason).
+    Returns (rate_per_kwh, source_description, source_url) or (None, reason, "").
     """
     models = _omnius_models()
     candidates = list(_OMNIUS_MODEL_CANDIDATES)
@@ -664,7 +670,7 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
             seen.add(m)
 
     if not candidates:
-        return None, "omnius unavailable (no key or unreachable)"
+        return None, "omnius unavailable (no key or unreachable)", ""
     preferred = [m for m in candidates if "9b" in m.lower() or "8b" in m.lower()]
     model = preferred[0] if preferred else candidates[0]
 
@@ -677,16 +683,14 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
     )
     resp = _omnius_chat(model, [{"role": "user", "content": prompt}])
     if not resp:
-        return None, f"omnius chat failed ({model})"
+        return None, f"omnius chat failed ({model})", ""
 
-    rate, util = None, ""
+    rate, util, url = None, "", ""
     for line in resp.splitlines():
         if line.startswith("RATE="):
             try:
                 val = line.split("=", 1)[1].strip().replace("$", "")
-                import re as _re
-
-                m = _re.search(r"(\d+\.?\d*)", val)
+                m = re.search(r"(\d+\.?\d*)", val)
                 if m:
                     rate = float(m.group(1))
             except (ValueError, IndexError):
@@ -696,22 +700,29 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str]:
                 util = line.split("=", 1)[1].strip()
             except IndexError:
                 pass
+        if line.startswith("SOURCE="):
+            try:
+                url = line.split("=", 1)[1].strip()
+            except IndexError:
+                pass
 
     if rate is not None:
-        return rate, f"{util or location} (Omnius)"
-
-    import re
+        return rate, f"{util or location} (Omnius)", url
 
     matches = re.findall(r"\$?([0-9]+\.[0-9]+)", resp)
     for m in matches:
         val = float(m)
         if 0.01 < val < 1.0:
-            return val, resp.split(".")[0][:60].strip() if len(resp) > 20 else location
+            return (
+                val,
+                resp.split(".")[0][:60].strip() if len(resp) > 20 else location,
+                url,
+            )
 
-    return None, f"no rate in omnius response"
+    return None, f"no rate in omnius response", url
 
 
-def discover_rate() -> tuple[float | None, str]:
+def discover_rate() -> tuple[float | None, str, str]:
     """Discover the local electricity rate.
 
     Order of precedence:
@@ -719,25 +730,30 @@ def discover_rate() -> tuple[float | None, str]:
       2. Omnius web search (always, if OMNIUS_API_KEY set)
       3. Built-in state/city rate table (fallback)
       4. Default fallback (CA average, $0.3375)
+
+    Returns (rate_per_kwh, source_description, source_url).
     """
+    global OMNIUS_SOURCE_URL
     location = _detect_location()
 
     key = _omnius_key()
     if key:
         if location:
-            rate, src = _discover_rate_via_omnius(location)
+            rate, src, url = _discover_rate_via_omnius(location)
             if rate is not None:
-                return rate, src
-        rate, src = _discover_rate_via_omnius("California")
+                OMNIUS_SOURCE_URL = url
+                return rate, src, url
+        rate, src, url = _discover_rate_via_omnius("California")
         if rate is not None:
-            return rate, src
+            OMNIUS_SOURCE_URL = url
+            return rate, src, url
 
     if location:
-        rate, src = _lookup_rate_builtin(location)
+        rate, src, _url = _lookup_rate_builtin(location)
         if rate is not None:
-            return rate, src
+            return rate, src, ""
 
-    return None, ""
+    return None, "", ""
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1062,7 +1078,9 @@ class Collector:
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def calc_costs(store: DataStore, rate: float = MUNICIPAL_RATE) -> dict[str, float]:
+def calc_costs(store: DataStore, rate: float | None = None) -> dict[str, float]:
+    if rate is None:
+        rate = MUNICIPAL_RATE
     elapsed_h = (time.time() - store.start_time) / 3600.0
     samples = store.samples
     if not samples:
@@ -1371,6 +1389,7 @@ class PowerTUI(App):
         self.store = store
         self.ups_data: dict[str, str] = {}
         self.rate_source = rate_source
+        self.rate_source_url: str = ""
         self._page = 1
         self._no_fetch = no_fetch
         self._rate_phase: str = "init"
@@ -1408,7 +1427,7 @@ class PowerTUI(App):
         self.ups_data = read_apc_ups()
 
     def _discover_rate(self) -> None:
-        global MUNICIPAL_RATE
+        global MUNICIPAL_RATE, OMNIUS_SOURCE_URL
         self._rate_phase = "locating"
         self._rate_msg = "Detecting location\u2026"
         location = _detect_location()
@@ -1417,10 +1436,11 @@ class PowerTUI(App):
 
         self._rate_phase = "omnius"
         self._rate_msg = "Querying Omnius for rates\u2026"
-        rate, src = discover_rate()
+        rate, src, url = discover_rate()
         if rate is not None:
             MUNICIPAL_RATE = rate
             self.rate_source = src
+            self.rate_source_url = url
             self._rate_phase = "done"
             self._rate_msg = f"Rate ${rate:.4f}/kWh \u2013 {src}"
             return
@@ -1446,8 +1466,12 @@ class PowerTUI(App):
             self.notify("Indicator stopped", timeout=2)
         else:
             script = Path(sys.argv[0]).resolve()
+            args = [str(VENV_PYTHON), str(script), "--indicator"]
+            args += ["--no-fetch-rate", "--rate", str(MUNICIPAL_RATE)]
+            if self.rate_source_url:
+                args += ["--rate-url", self.rate_source_url]
             proc = subprocess.Popen(
-                [str(VENV_PYTHON), str(script), "--indicator", "--no-fetch-rate"],
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -1614,11 +1638,12 @@ class PowerTUI(App):
         )
         if self._rate_phase == "done":
             src = self.rate_source[:45] if self.rate_source else "default"
-            return f"  Rate source: {src:<45}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
+            url = self.rate_source_url or ""
+            url_line = f"\n  {url}" if url else ""
+            return f"  Rate source: {src:<45}{url_line}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
         spinner = "\u25d0\u25d1\u25d2\u25d3"[int(time.time() * 2) % 4]
         msg = self._rate_msg or "Initializing\u2026"
         return f"  {spinner} {msg:<55}\n  {'':>20} {ind}\n"
-        return f"  Rate source: {src:<45}\n  ${MUNICIPAL_RATE:.4f}/kWh  {ind}\n"
 
     def update_ui(self) -> None:
         try:
@@ -1731,6 +1756,10 @@ def run_indicator() -> None:
             collector.stop()
             icon.stop()
 
+        def _open_rate_url(item):
+            if OMNIUS_SOURCE_URL:
+                webbrowser.open(OMNIUS_SOURCE_URL)
+
         def _pystray_tick(icon: pystray.Icon) -> None:
             try:
                 _update_icon_data(icon)
@@ -1741,7 +1770,12 @@ def run_indicator() -> None:
         icon = pystray.Icon(
             "power-monitor",
             _create_icon(0),
-            menu=pystray.Menu(pystray.MenuItem("Quit", _on_quit)),
+            menu=pystray.Menu(
+                pystray.MenuItem(
+                    lambda: f"Rate: ${MUNICIPAL_RATE:.3f}/kWh", _open_rate_url
+                ),
+                pystray.MenuItem("Quit", _on_quit),
+            ),
         )
         _update_icon_data(icon)
         Timer(5, _pystray_tick, [icon]).start()
@@ -1809,8 +1843,13 @@ def run_indicator() -> None:
     menu.append(Gtk.SeparatorMenuItem())
 
     mi_rate = Gtk.MenuItem(label="Rate: $---/kWh")
-    mi_rate.set_sensitive(False)
     menu.append(mi_rate)
+
+    def _open_rate_url(*a):
+        if OMNIUS_SOURCE_URL:
+            webbrowser.open(OMNIUS_SOURCE_URL)
+
+    mi_rate.connect("activate", _open_rate_url)
 
     menu.append(Gtk.SeparatorMenuItem())
 
@@ -2011,7 +2050,22 @@ def main() -> None:
         action="store_true",
         help="Skip Omnius rate discovery on startup",
     )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        help="Set municipal electricity rate ($/kWh)",
+    )
+    parser.add_argument(
+        "--rate-url",
+        help="Source URL for the electricity rate",
+    )
     args = parser.parse_args()
+
+    if args.rate is not None:
+        MUNICIPAL_RATE = args.rate
+    if args.rate_url:
+        global OMNIUS_SOURCE_URL
+        OMNIUS_SOURCE_URL = args.rate_url
 
     if args.install_service:
         install_service()
@@ -2024,9 +2078,11 @@ def main() -> None:
     elif args.indicator:
         run_indicator()
     elif args.fetch_rate:
-        rate, source = discover_rate()
+        rate, source, url = discover_rate()
         if rate is not None:
             print(f"Rate: ${rate:.4f}/kWh  Source: {source}")
+            if url:
+                print(f"URL:  {url}")
             print(f"Set:  export POWER_RATE={rate}")
         else:
             print(f"Rate discovery failed: {source}")
