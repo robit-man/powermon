@@ -121,6 +121,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal
 from textual.widgets import Header, Static, Footer
 from textual.command import Provider, Hit, Hits
+from textual import events
 from rich.text import Text
 
 # ── OMNIUS BOOTSTRAP ────────────────────────────────────────────────────────
@@ -1422,6 +1423,9 @@ class PowerTUI(App):
                         self.store.cum_joules[k] = v * 3_600_000.0
         if not self._no_fetch:
             Thread(target=self._discover_rate, daemon=True).start()
+        self.query_one("#rate-box").on(
+            events.Click, lambda e: self.action_toggle_indicator()
+        )
 
     def on_unmount(self) -> None:
         pass
