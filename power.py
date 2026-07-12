@@ -126,8 +126,9 @@ from textual import on
 from rich.text import Text
 
 # ── OMNIUS BOOTSTRAP ────────────────────────────────────────────────────────
-# Self-contained: installs the omnius npm package, spawns the daemon, and
-# mints a power-monitor-scoped API key — no dependency on cygnus or other apps.
+# The system service owns its Omnius child, but never its version: on every
+# service start it resolves the registry's current release, upgrades when it
+# has drifted, and only then starts/reuses a matching daemon.
 
 OMNIUS_ENDPOINT = os.environ.get("OMNIUS_ENDPOINT", "http://localhost:11435")
 OMNIUS_KEY_FILE = Path.home() / ".omnius" / "power-monitor.env"
@@ -135,7 +136,7 @@ OMNIUS_DAEMON_ENV = Path.home() / ".omnius" / "cygnus-daemon.env"
 
 
 def _find_npm() -> str | None:
-    for exe in ("npm", "fnm"):
+    for exe in ("npm",):
         try:
             return subprocess.check_output(["which", exe], text=True).strip()
         except Exception:
@@ -154,20 +155,60 @@ def _omnius_installed() -> str | None:
     return None
 
 
-def _install_omnius() -> bool:
+def _omnius_global_version() -> str | None:
+    """Return the package version installed in npm's active global prefix."""
+    try:
+        global_root = subprocess.check_output(
+            ["npm", "root", "-g"], text=True, stderr=subprocess.DEVNULL, timeout=15
+        ).strip()
+        package_json = Path(global_root) / "omnius" / "package.json"
+        return str(json.loads(package_json.read_text()).get("version") or "") or None
+    except Exception:
+        return None
+
+
+def _omnius_registry_version() -> str | None:
+    """Resolve the current public release without trusting npm's stale cache."""
+    try:
+        version = subprocess.check_output(
+            ["npm", "view", "omnius", "version", "--prefer-online", "--cache-min=0"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        ).strip()
+        return version or None
+    except Exception:
+        return None
+
+
+def _install_omnius(version: str = "latest") -> bool:
+    """Install the exact current release before this service launches Omnius."""
     npm = _find_npm()
     if not npm:
         return False
     try:
         subprocess.check_call(
-            ["npm", "install", "-g", "omnius"],
+            [npm, "install", "-g", f"omnius@{version}", "--prefer-online", "--cache-min=0"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=120,
+            timeout=240,
         )
         return True
     except Exception:
         return False
+
+
+def _daemon_version() -> str | None:
+    try:
+        response = httpx.get(f"{OMNIUS_ENDPOINT}/health", timeout=2)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        # New Omnius daemon builds report immutable boot_version.  Fall back
+        # only for pre-boot-identity builds during their final migration.
+        return payload.get("boot_version") or payload.get("version")
+    except Exception:
+        return None
 
 
 def _daemon_running() -> bool:
@@ -191,6 +232,50 @@ def _daemon_pids() -> list[int]:
     except Exception:
         pass
     return pids
+
+
+def _power_monitor_cgroup() -> str | None:
+    """The systemd unit cgroup of this process, if it is service-managed."""
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if "power-monitor.service" in line:
+                return line.rsplit(":", 1)[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _stop_service_owned_daemons() -> None:
+    """Stop only Omnius children proven to belong to this systemd service."""
+    cgroup = _power_monitor_cgroup()
+    if not cgroup:
+        return
+    owned: list[int] = []
+    for pid in _daemon_pids():
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\x00", " ")
+            process_cgroups = Path(f"/proc/{pid}/cgroup").read_text()
+            if "serve" in cmdline and "--daemon" in cmdline and cgroup in process_cgroups:
+                owned.append(pid)
+        except Exception:
+            continue
+    for pid in owned:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return
+    deadline = time.monotonic() + 5
+    while owned and time.monotonic() < deadline:
+        owned = [pid for pid in owned if Path(f"/proc/{pid}").exists()]
+        if owned:
+            time.sleep(0.1)
+    for pid in owned:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _spawn_daemon(key: str | None = None) -> None:
@@ -264,30 +349,32 @@ def _test_key(key: str) -> bool:
 
 
 def _ensure_omnius() -> None:
-    """Bootstrap Omnius for the power-monitor: install, spawn, own key.
-
-    Key resolution:
-      1. If daemon is already running, read its run key from the daemon's
-         own config file (~/.omnius/cygnus-daemon.env) and use it.
-      2. If daemon is not running, generate a fresh key and spawn a new
-         daemon with OMNIUS_API_KEY set in its environment.
-      3. Persist the working key to ~/.omnius/power-monitor.env.
-    """
-    if _omnius_installed() is None:
-        if not _install_omnius():
+    """Upgrade to the registry release and launch that exact daemon version."""
+    latest = _omnius_registry_version()
+    installed = _omnius_global_version()
+    if _omnius_installed() is None or (latest and latest != installed):
+        if not _install_omnius(latest or "latest"):
             return
+        installed = _omnius_global_version()
 
+    running_version = _daemon_version()
     key = _stored_key()
-    if key and _test_key(key):
+    if key and _test_key(key) and (not installed or running_version == installed):
         os.environ["OMNIUS_API_KEY"] = key
         return
 
-    if _daemon_running():
+    if _daemon_running() and (not installed or running_version == installed):
         dkey = _read_daemon_run_key()
         if dkey and _test_key(dkey):
             _persist_key(dkey)
             os.environ["OMNIUS_API_KEY"] = dkey
             return
+
+    # A stale daemon that was launched by this service is safe to hand off:
+    # it has both the Omnius daemon command line and this unit's cgroup.
+    # Never touch an unrelated listener on the shared port.
+    if _daemon_running() and installed and running_version != installed:
+        _stop_service_owned_daemons()
 
     key = _generate_key()
     _persist_key(key)
