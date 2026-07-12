@@ -1466,6 +1466,7 @@ class PowerTUI(App):
             except (ValueError, OSError):
                 pass
             pid_file.unlink(missing_ok=True)
+            uninstall_indicator_autostart()
             self.notify("Indicator stopped", timeout=2)
         else:
             script = Path(sys.argv[0]).resolve()
@@ -1481,6 +1482,7 @@ class PowerTUI(App):
             )
             pid_file.parent.mkdir(parents=True, exist_ok=True)
             pid_file.write_text(str(proc.pid))
+            install_indicator_autostart(MUNICIPAL_RATE, self.rate_source_url)
             self.notify("Indicator started", timeout=2)
 
     def _indicator_running(self) -> bool:
@@ -1933,7 +1935,7 @@ def run_indicator() -> None:
 SERVICE_UNIT = textwrap.dedent(f"""\
     [Unit]
     Description=Power Monitor Daemon
-    Documentation=https://github.com/\u2026
+    Documentation=https://github.com/robit-man/powermon
     Wants=network.target
     After=network.target
 
@@ -2009,14 +2011,19 @@ def show_service_status() -> None:
         print("  Data file not found")
 
 
-def install_indicator_autostart() -> None:
+def install_indicator_autostart(rate: float | None = None, rate_url: str = "") -> None:
     INDICATOR_AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+    exec_parts = [str(VENV_PYTHON), str(SCRIPT_DIR / "power.py"), "--indicator"]
+    if rate is not None:
+        exec_parts += ["--no-fetch-rate", "--rate", f"{rate:.4f}"]
+        if rate_url:
+            exec_parts += ["--rate-url", rate_url]
     INDICATOR_AUTOSTART_FILE.write_text(
         textwrap.dedent(f"""\
             [Desktop Entry]
             Type=Application
             Name=Power Monitor Indicator
-            Exec={VENV_PYTHON} {SCRIPT_DIR / "power.py"} --indicator
+            Exec={" ".join(exec_parts)}
             Hidden=false
             NoDisplay=false
             X-GNOME-Autostart-enabled=true
