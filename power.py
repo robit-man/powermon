@@ -133,6 +133,9 @@ from rich.text import Text
 OMNIUS_ENDPOINT = os.environ.get("OMNIUS_ENDPOINT", "http://localhost:11435")
 OMNIUS_KEY_FILE = Path.home() / ".omnius" / "power-monitor.env"
 OMNIUS_DAEMON_ENV = Path.home() / ".omnius" / "cygnus-daemon.env"
+OMNIUS_SUPERVISOR_INTERVAL_S = 15
+_omnius_ensure_lock = Lock()
+_omnius_supervisor_started = False
 
 
 def _find_npm() -> str | None:
@@ -144,27 +147,37 @@ def _find_npm() -> str | None:
     return None
 
 
-def _omnius_installed() -> str | None:
+def _omnius_global_install() -> tuple[str, Path] | None:
+    """Return the active npm-global Omnius version and its matching launcher."""
+    npm = _find_npm()
+    if not npm:
+        return None
     try:
-        out = subprocess.check_output(
-            ["which", "omnius"], text=True, stderr=subprocess.DEVNULL
-        )
-        return out.strip()
+        global_root = subprocess.check_output(
+            [npm, "root", "-g"], text=True, stderr=subprocess.DEVNULL, timeout=15
+        ).strip()
+        prefix = subprocess.check_output(
+            [npm, "prefix", "-g"], text=True, stderr=subprocess.DEVNULL, timeout=15
+        ).strip()
+        package_json = Path(global_root) / "omnius" / "package.json"
+        version = str(json.loads(package_json.read_text()).get("version") or "")
+        binary = Path(prefix) / ("omnius.cmd" if os.name == "nt" else "bin/omnius")
+        if version and binary.is_file():
+            return version, binary
     except Exception:
-        pass
+        return None
     return None
+
+
+def _omnius_installed() -> str | None:
+    install = _omnius_global_install()
+    return str(install[1]) if install else None
 
 
 def _omnius_global_version() -> str | None:
     """Return the package version installed in npm's active global prefix."""
-    try:
-        global_root = subprocess.check_output(
-            ["npm", "root", "-g"], text=True, stderr=subprocess.DEVNULL, timeout=15
-        ).strip()
-        package_json = Path(global_root) / "omnius" / "package.json"
-        return str(json.loads(package_json.read_text()).get("version") or "") or None
-    except Exception:
-        return None
+    install = _omnius_global_install()
+    return install[0] if install else None
 
 
 def _omnius_registry_version() -> str | None:
@@ -278,23 +291,26 @@ def _stop_service_owned_daemons() -> None:
             pass
 
 
-def _spawn_daemon(key: str | None = None) -> None:
+def _spawn_daemon(key: str | None = None) -> bool:
+    """Launch exactly the launcher paired with npm's installed package."""
     try:
-        omnius_bin = subprocess.check_output(
-            ["which", "omnius"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
+        install = _omnius_global_install()
+        if not install:
+            return False
+        _, omnius_bin = install
         env = os.environ.copy()
         if key:
             env["OMNIUS_API_KEY"] = key
         subprocess.Popen(
-            [omnius_bin, "serve", "--daemon", "--quiet"],
+            [str(omnius_bin), "serve", "--daemon", "--quiet"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             env=env,
         )
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _generate_key() -> str:
@@ -348,45 +364,71 @@ def _test_key(key: str) -> bool:
         return False
 
 
-def _ensure_omnius() -> None:
-    """Upgrade to the registry release and launch that exact daemon version."""
-    latest = _omnius_registry_version()
-    installed = _omnius_global_version()
-    if _omnius_installed() is None or (latest and latest != installed):
-        if not _install_omnius(latest or "latest"):
-            return
+def _ensure_omnius() -> bool:
+    """Install the registry release and verify a daemon booted that exact code."""
+    with _omnius_ensure_lock:
+        latest = _omnius_registry_version()
         installed = _omnius_global_version()
+        if _omnius_installed() is None or (latest and latest != installed):
+            if not _install_omnius(latest or "latest"):
+                return False
+            installed = _omnius_global_version()
+        if not installed:
+            return False
 
-    running_version = _daemon_version()
-    key = _stored_key()
-    if key and _test_key(key) and (not installed or running_version == installed):
+        running_version = _daemon_version()
+        key = _stored_key()
+        if key and _test_key(key) and running_version == installed:
+            os.environ["OMNIUS_API_KEY"] = key
+            return True
+
+        if _daemon_running() and running_version == installed:
+            dkey = _read_daemon_run_key()
+            if dkey and _test_key(dkey):
+                _persist_key(dkey)
+                os.environ["OMNIUS_API_KEY"] = dkey
+                return True
+
+        # A stale daemon launched by this service is safe to hand off. Never
+        # kill an arbitrary port listener: if it is not ours, exact-version
+        # verification below fails and the parent/TUI can report that fact.
+        if _daemon_running() and running_version != installed:
+            _stop_service_owned_daemons()
+
+        key = key or _generate_key()
+        _persist_key(key)
         os.environ["OMNIUS_API_KEY"] = key
+        if not _spawn_daemon(key):
+            return False
+        for _ in range(30):
+            time.sleep(1)
+            if _daemon_version() == installed and _test_key(key):
+                return True
+        return False
+
+
+def _start_omnius_supervisor() -> None:
+    """Keep the service-owned daemon current after a live package replacement."""
+    global _omnius_supervisor_started
+    if _omnius_supervisor_started or not _power_monitor_cgroup():
         return
+    _omnius_supervisor_started = True
 
-    if _daemon_running() and (not installed or running_version == installed):
-        dkey = _read_daemon_run_key()
-        if dkey and _test_key(dkey):
-            _persist_key(dkey)
-            os.environ["OMNIUS_API_KEY"] = dkey
-            return
+    def run() -> None:
+        while True:
+            time.sleep(OMNIUS_SUPERVISOR_INTERVAL_S)
+            try:
+                _ensure_omnius()
+            except Exception:
+                # Power collection must keep running if npm/network is absent;
+                # the next interval retries exact-version supervision.
+                pass
 
-    # A stale daemon that was launched by this service is safe to hand off:
-    # it has both the Omnius daemon command line and this unit's cgroup.
-    # Never touch an unrelated listener on the shared port.
-    if _daemon_running() and installed and running_version != installed:
-        _stop_service_owned_daemons()
-
-    key = _generate_key()
-    _persist_key(key)
-    os.environ["OMNIUS_API_KEY"] = key
-    _spawn_daemon(key)
-    for _ in range(30):
-        time.sleep(1)
-        if _daemon_running():
-            break
+    Thread(target=run, daemon=True, name="omnius-power-supervisor").start()
 
 
 _ensure_omnius()
+_start_omnius_supervisor()
 
 # ── CONFIGURATION ───────────────────────────────────────────────────────────
 
