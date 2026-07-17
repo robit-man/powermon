@@ -126,9 +126,10 @@ from textual import on
 from rich.text import Text
 
 # ── OMNIUS BOOTSTRAP ────────────────────────────────────────────────────────
-# The system service owns its Omnius child, but never its version: on every
-# service start it resolves the registry's current release, upgrades when it
-# has drifted, and only then starts/reuses a matching daemon.
+# Omnius is optional and is used only by an explicit electricity-rate lookup.
+# The power sampler must never install, supervise, or spawn an Omnius daemon:
+# a detached model server is unrelated to sampling and can outlive a failed
+# upgrade attempt inside the long-running system service.
 
 OMNIUS_ENDPOINT = os.environ.get("OMNIUS_ENDPOINT", "http://localhost:11435")
 OMNIUS_KEY_FILE = Path.home() / ".omnius" / "power-monitor.env"
@@ -426,9 +427,6 @@ def _start_omnius_supervisor() -> None:
 
     Thread(target=run, daemon=True, name="omnius-power-supervisor").start()
 
-
-_ensure_omnius()
-_start_omnius_supervisor()
 
 # ── CONFIGURATION ───────────────────────────────────────────────────────────
 
@@ -2080,6 +2078,12 @@ SERVICE_UNIT = textwrap.dedent(f"""\
     ExecStart={VENV_PYTHON} {SCRIPT_DIR / "power.py"} --daemon
     Restart=always
     RestartSec=5
+    KillMode=control-group
+    MemoryHigh=256M
+    MemoryMax=512M
+    MemorySwapMax=0
+    TasksMax=128
+    OOMPolicy=kill
     StandardOutput=append:{SYSTEM_DATA_DIR / "stdout.log"}
     StandardError=append:{SYSTEM_DATA_DIR / "stderr.log"}
 
