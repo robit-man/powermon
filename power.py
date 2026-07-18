@@ -132,8 +132,11 @@ from rich.text import Text
 # Omnius daemon children.
 
 OMNIUS_ENDPOINT = os.environ.get("OMNIUS_ENDPOINT", "http://localhost:11435")
-OMNIUS_KEY_FILE = Path.home() / ".omnius" / "power-monitor.env"
-OMNIUS_DAEMON_ENV = Path.home() / ".omnius" / "cygnus-daemon.env"
+OMNIUS_HOME = Path(os.environ.get("OMNIUS_HOME", str(Path.home() / ".omnius")))
+OMNIUS_KEY_FILE = OMNIUS_HOME / "power-monitor.env"
+OMNIUS_DAEMON_ENV = OMNIUS_HOME / "cygnus-daemon.env"
+OMNIUS_BOOTSTRAP_KEY_FILE = OMNIUS_HOME / "api.key"
+OMNIUS_RUNTIME_KEYS_FILE = OMNIUS_HOME / "keys.json"
 _omnius_ensure_lock = Lock()
 
 
@@ -244,31 +247,130 @@ def _generate_key() -> str:
     return "pm_" + secrets.token_hex(32)
 
 
-def _read_daemon_run_key() -> str | None:
-    env_file = Path.home() / ".omnius" / "cygnus-daemon.env"
-    if not env_file.exists():
+def _clean_key_value(value: str) -> str:
+    return value.strip().strip('"').strip("'")
+
+
+def _read_env_key_file(path: Path, names: tuple[str, ...]) -> str | None:
+    if not path.exists():
         return None
     try:
-        for line in env_file.read_text().splitlines():
-            if line.startswith("OMNIUS_RUN_API_KEY="):
-                return line.split("=", 1)[1].strip()
-            if line.startswith("OMNIUS_API_KEY="):
-                return line.split("=", 1)[1].strip()
+        for raw_line in path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() in names:
+                key = _clean_key_value(value)
+                if key:
+                    return key
     except Exception:
         pass
     return None
 
 
 def _stored_key() -> str | None:
-    if not OMNIUS_KEY_FILE.exists():
+    return _read_env_key_file(
+        OMNIUS_KEY_FILE,
+        (
+            "OMNIUS_REST_RUN_API_KEY",
+            "OMNIUS_RUN_API_KEY",
+            "OMNIUS_REST_API_KEY",
+            "OMNIUS_API_KEY",
+        ),
+    )
+
+
+def _read_daemon_run_key() -> str | None:
+    return _read_env_key_file(
+        OMNIUS_DAEMON_ENV,
+        (
+            "OMNIUS_REST_RUN_API_KEY",
+            "OMNIUS_RUN_API_KEY",
+            "OMNIUS_REST_API_KEY",
+            "OMNIUS_API_KEY",
+        ),
+    )
+
+
+def _read_bootstrap_api_key() -> str | None:
+    if not OMNIUS_BOOTSTRAP_KEY_FILE.exists():
         return None
     try:
-        for line in OMNIUS_KEY_FILE.read_text().splitlines():
-            if line.startswith("OMNIUS_API_KEY="):
-                return line.split("=", 1)[1].strip()
+        text = OMNIUS_BOOTSTRAP_KEY_FILE.read_text().strip()
+        if not text:
+            return None
+        if "=" in text and "\n" not in text:
+            text = text.split("=", 1)[1]
+        return _clean_key_value(text.splitlines()[0])
     except Exception:
-        pass
-    return None
+        return None
+
+
+def _runtime_key_candidates(include_read: bool = False) -> list[str]:
+    if not OMNIUS_RUNTIME_KEYS_FILE.exists():
+        return []
+    try:
+        data = json.loads(OMNIUS_RUNTIME_KEYS_FILE.read_text())
+    except Exception:
+        return []
+
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        records = data.get("keys") or data.get("data") or []
+    else:
+        records = []
+
+    allowed = {"admin", "run"}
+    if include_read:
+        allowed.add("read")
+    scope_rank = {"admin": 0, "run": 1, "read": 2}
+    ranked: list[tuple[int, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("revoked"):
+            continue
+        scope = str(record.get("scope") or "read").lower()
+        if scope not in allowed:
+            continue
+        key = record.get("key") or record.get("token") or record.get("secret")
+        if isinstance(key, str) and key.strip():
+            ranked.append((scope_rank.get(scope, 99), key.strip()))
+    ranked.sort(key=lambda item: item[0])
+    return [key for _rank, key in ranked]
+
+
+def _configured_omnius_key_candidates(include_read: bool = False) -> list[str]:
+    env_names = [
+        "OMNIUS_REST_RUN_API_KEY",
+        "OMNIUS_RUN_API_KEY",
+        "OMNIUS_REST_ADMIN_API_KEY",
+        "OMNIUS_ADMIN_API_KEY",
+        "OMNIUS_REST_API_KEY",
+        "OMNIUS_API_KEY",
+    ]
+    if include_read:
+        env_names = ["OMNIUS_REST_READ_API_KEY", "OMNIUS_READ_API_KEY"] + env_names
+
+    candidates: list[str] = []
+
+    def add(key: str | None) -> None:
+        if key and key not in candidates:
+            candidates.append(key)
+
+    for name in env_names:
+        add(os.environ.get(name))
+    add(_stored_key())
+    add(_read_daemon_run_key())
+    add(_read_bootstrap_api_key())
+    for key in _runtime_key_candidates(include_read=include_read):
+        add(key)
+
+    return candidates
 
 
 def _persist_key(key: str) -> None:
@@ -289,16 +391,10 @@ def _test_key(key: str) -> bool:
         return False
 
 
-def _usable_daemon_key() -> str | None:
+def _usable_daemon_key(include_read: bool = False) -> str | None:
     """Return a credential accepted by the daemon without changing its state."""
-    candidates = (
-        os.environ.get("OMNIUS_RUN_API_KEY"),
-        os.environ.get("OMNIUS_API_KEY"),
-        _stored_key(),
-        _read_daemon_run_key(),
-    )
-    for key in candidates:
-        if key and _test_key(key):
+    for key in _configured_omnius_key_candidates(include_read=include_read):
+        if _test_key(key):
             return key
     return None
 
@@ -630,16 +726,16 @@ def _detect_location() -> str:
     return ""
 
 
-# ── OMNIUS RATE DISCOVERY (self-contained, no cygnus dependency) ─────────────
+# ── OMNIUS RATE DISCOVERY ────────────────────────────────────────────────────
 
 
 def _omnius_key(key_name: str = "OMNIUS_RUN_API_KEY") -> str | None:
-    """Resolve an Omnius API key from env vars only.
-
-    Self-contained: never reads ~/.omnius/cygnus-daemon.env.
-    User must set OMNIUS_API_KEY or OMNIUS_RUN_API_KEY in their environment.
-    """
-    return os.environ.get(key_name) or os.environ.get("OMNIUS_API_KEY")
+    """Resolve a key for Omnius REST calls, including current local key files."""
+    key = os.environ.get(key_name)
+    if key:
+        return key
+    include_read = "READ" in key_name
+    return _usable_daemon_key(include_read=include_read)
 
 
 def _omnius_models() -> list[str]:
@@ -661,10 +757,63 @@ def _omnius_models() -> list[str]:
         return []
 
 
-def _omnius_chat(model: str, messages: list[dict]) -> str | None:
+def _rate_timeout_s() -> float:
+    try:
+        requested = float(os.environ.get("OMNIUS_RATE_TIMEOUT", "180"))
+        return max(1.0, min(3600.0, requested))
+    except ValueError:
+        return 180.0
+
+
+def _sanitize_omnius_error(message: str) -> str:
+    message = re.sub(
+        r"https://openrouter\.ai/workspaces/\S+",
+        "OpenRouter key settings",
+        message,
+    )
+    message = re.sub(r"(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+", r"\1...", message)
+    return re.sub(r"\s+", " ", message).strip()[:240]
+
+
+def _omnius_error_message(payload: Any) -> str:
+    messages: list[str] = []
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        text = _sanitize_omnius_error(str(value))
+        if text and text not in messages:
+            messages.append(text)
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            error = value.get("error")
+            if isinstance(error, dict):
+                add(error.get("message") or error.get("code"))
+            else:
+                add(error)
+            for key in ("message", "detail", "title"):
+                add(value.get(key))
+            details = value.get("details")
+            if isinstance(details, str):
+                try:
+                    walk(json.loads(details))
+                except Exception:
+                    add(details)
+            elif details is not None:
+                walk(details)
+        elif isinstance(value, str):
+            add(value)
+
+    walk(payload)
+    return "; ".join(messages[:3])
+
+
+def _omnius_chat(model: str, messages: list[dict]) -> tuple[str | None, str]:
     key = _omnius_key()
     if not key:
-        return None
+        return None, "no run-capable Omnius API key"
+    timeout_s = _rate_timeout_s()
     try:
         r = httpx.post(
             f"{OMNIUS_ENDPOINT}/v1/chat/completions",
@@ -672,13 +821,29 @@ def _omnius_chat(model: str, messages: list[dict]) -> str | None:
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
             },
-            json={"model": model, "messages": messages, "stream": False},
-            timeout=120,
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "agent_loop": True,
+                "include_daemon_tools": ["read"],
+                "prompt_template": "factual-first",
+                "timeout_s": timeout_s,
+            },
+            timeout=timeout_s + 10,
         )
         data = r.json()
-        return data.get("choices", [{}])[0].get("message", {}).get("content")
-    except Exception:
-        return None
+        if r.status_code >= 400 or "error" in data:
+            error = _omnius_error_message(data) or "request failed"
+            return None, f"HTTP {r.status_code}: {error}"
+        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+        if content:
+            return content, ""
+        return None, _omnius_error_message(data) or "empty Omnius response"
+    except httpx.TimeoutException:
+        return None, "Omnius rate request timed out"
+    except Exception as exc:
+        return None, f"Omnius request failed: {exc.__class__.__name__}"
 
 
 _OMNIUS_MODEL_CANDIDATES = [
@@ -691,25 +856,82 @@ _OMNIUS_MODEL_CANDIDATES = [
 OMNIUS_SOURCE_URL: str = ""
 
 
+def _omnius_rate_models() -> list[str]:
+    candidates: list[str] = []
+
+    def add(model: str | None) -> None:
+        if model and model not in candidates:
+            candidates.append(model)
+
+    add(os.environ.get("OMNIUS_RATE_MODEL"))
+    add("auto")
+    models = _omnius_models()
+    advertised = set(models)
+    for model in _OMNIUS_MODEL_CANDIDATES:
+        if not advertised or model in advertised:
+            add(model)
+    return candidates
+
+
+def _field_value(text: str, name: str) -> str:
+    match = re.search(
+        rf"\b{name}\s*=\s*(.*?)(?=\s+\b(?:RATE|UTILITY|SOURCE)\s*=|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1).strip().strip('"').strip("'") if match else ""
+
+
+def _normalise_rate(value: float) -> float:
+    if 1.0 < value <= 100.0:
+        return value / 100.0
+    return value
+
+
+def _parse_omnius_rate_response(
+    response: str, location: str
+) -> tuple[float | None, str, str]:
+    text = response.strip()
+    url_match = re.search(r"https?://[^\s,;]+", text)
+    url = _field_value(text, "SOURCE") or (url_match.group(0) if url_match else "")
+    url = url.rstrip(".,;)")
+    util = _field_value(text, "UTILITY")
+
+    rate_text = _field_value(text, "RATE")
+    if rate_text:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", rate_text)
+        if match:
+            rate = _normalise_rate(float(match.group(1)))
+            if 0.01 < rate < 1.0:
+                return rate, f"{util or location} (Omnius)", url
+
+    rate_pattern = r"\$?\s*([0-9]+(?:\.[0-9]+)?)\s*(cents?|¢)?"
+    for match in re.finditer(rate_pattern, text, re.I):
+        rate = float(match.group(1))
+        if match.group(2) or rate > 1.0:
+            rate = _normalise_rate(rate)
+        if 0.01 < rate < 1.0:
+            source = util or text.split(".")[0][:60].strip() or location
+            return rate, f"{source} (Omnius)", url
+
+    return None, "", url
+
+
+def _source_with_omnius_error(source: str, error: str) -> str:
+    if not error:
+        return source
+    return f"{source}; Omnius: {_sanitize_omnius_error(error)}"
+
+
 def _discover_rate_via_omnius(location: str) -> tuple[float | None, str, str]:
     """Query Omnius for electricity rate at *location*.
 
-    Tries known model names directly (no models endpoint dependency),
-    falling back to the models API if needed.
+    Uses Omnius' current agent-loop web-search path with model auto-routing.
     Returns (rate_per_kwh, source_description, source_url) or (None, reason, "").
     """
-    models = _omnius_models()
-    candidates = list(_OMNIUS_MODEL_CANDIDATES)
-    seen = set(candidates)
-    for m in models or []:
-        if m not in seen:
-            candidates.append(m)
-            seen.add(m)
-
+    candidates = _omnius_rate_models()
     if not candidates:
         return None, "omnius unavailable (no key or unreachable)", ""
-    preferred = [m for m in candidates if "9b" in m.lower() or "8b" in m.lower()]
-    model = preferred[0] if preferred else candidates[0]
 
     prompt = (
         f"Search the web for the current residential electricity rate in "
@@ -718,45 +940,22 @@ def _discover_rate_via_omnius(location: str) -> tuple[float | None, str, str]:
         "Return ONLY: RATE=<number> UTILITY=<name> SOURCE=<url>. "
         "No other text."
     )
-    resp = _omnius_chat(model, [{"role": "user", "content": prompt}])
-    if not resp:
-        return None, f"omnius chat failed ({model})", ""
+    last_error = ""
+    last_url = ""
+    for model in candidates:
+        resp, error = _omnius_chat(model, [{"role": "user", "content": prompt}])
+        if not resp:
+            last_error = f"omnius chat failed ({model}): {error}"
+            if "not a valid model id" in error.lower():
+                continue
+            return None, last_error, ""
+        rate, source, url = _parse_omnius_rate_response(resp, location)
+        last_url = url
+        if rate is not None:
+            return rate, source, url
+        last_error = f"no rate in omnius response ({model})"
 
-    rate, util, url = None, "", ""
-    for line in resp.splitlines():
-        if line.startswith("RATE="):
-            try:
-                val = line.split("=", 1)[1].strip().replace("$", "")
-                m = re.search(r"(\d+\.?\d*)", val)
-                if m:
-                    rate = float(m.group(1))
-            except (ValueError, IndexError):
-                pass
-        if line.startswith("UTILITY="):
-            try:
-                util = line.split("=", 1)[1].strip()
-            except IndexError:
-                pass
-        if line.startswith("SOURCE="):
-            try:
-                url = line.split("=", 1)[1].strip()
-            except IndexError:
-                pass
-
-    if rate is not None:
-        return rate, f"{util or location} (Omnius)", url
-
-    matches = re.findall(r"\$?([0-9]+\.[0-9]+)", resp)
-    for m in matches:
-        val = float(m)
-        if 0.01 < val < 1.0:
-            return (
-                val,
-                resp.split(".")[0][:60].strip() if len(resp) > 20 else location,
-                url,
-            )
-
-    return None, f"no rate in omnius response", url
+    return None, last_error or "omnius chat failed", last_url
 
 
 def discover_rate() -> tuple[float | None, str, str]:
@@ -764,35 +963,37 @@ def discover_rate() -> tuple[float | None, str, str]:
 
     Order of precedence:
       1. POWER_RATE env var (already loaded into MUNICIPAL_RATE)
-      2. Omnius web search (always, if OMNIUS_API_KEY set)
+      2. Omnius web search
       3. Built-in state/city rate table (fallback)
       4. Default fallback (CA average, $0.3375)
 
     Returns (rate_per_kwh, source_description, source_url).
     """
     global OMNIUS_SOURCE_URL
-    if not _ensure_omnius():
-        return None, "omnius unavailable or not authorized", ""
     location = _detect_location()
+    omnius_error = ""
 
-    key = _omnius_key()
-    if key:
+    if _ensure_omnius():
         if location:
             rate, src, url = _discover_rate_via_omnius(location)
             if rate is not None:
                 OMNIUS_SOURCE_URL = url
                 return rate, src, url
+            omnius_error = src
         rate, src, url = _discover_rate_via_omnius("California")
         if rate is not None:
             OMNIUS_SOURCE_URL = url
             return rate, src, url
+        omnius_error = src or omnius_error
+    else:
+        omnius_error = "omnius unavailable or not authorized"
 
     if location:
         rate, src, _url = _lookup_rate_builtin(location)
         if rate is not None:
-            return rate, src, ""
+            return rate, _source_with_omnius_error(src, omnius_error), ""
 
-    return None, "", ""
+    return None, omnius_error, ""
 
 
 # ══════════════════════════════════════════════════════════════════════════
